@@ -7,6 +7,25 @@ const axios = require('axios');
 const querystring = require('querystring');
 const { Parser: CsvParser } = require('json2csv');
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const FileStore = require('session-file-store')(session);
+const path = require('path');
+const fs = require('fs');
+
+// Environment variable validation
+const requiredEnvVars = [
+  'SPOTIFY_CLIENT_ID',
+  'SPOTIFY_CLIENT_SECRET', 
+  'SPOTIFY_REDIRECT_URI',
+  'SESSION_SECRET'
+];
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -14,7 +33,14 @@ const PORT = process.env.PORT || 3001;
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI;
-const FRONTEND_URI = 'http://127.0.0.1:5173';
+const isProduction = process.env.NODE_ENV === 'production';
+const FRONTEND_URL = isProduction ? process.env.FRONTEND_URL || 'https://yourdomain.com' : 'http://localhost:5173';
+
+// Validate production configuration
+if (isProduction && (!process.env.FRONTEND_URL || !process.env.FRONTEND_URL.startsWith('https://'))) {
+  console.error('FRONTEND_URL must be set to an HTTPS URL in production');
+  process.exit(1);
+}
 
 const SCOPES = [
   'playlist-read-private',
@@ -23,120 +49,98 @@ const SCOPES = [
 ].join(' ');
 
 app.use(cors({
-  origin: 'http://127.0.0.1:5173',
-  credentials: true
+  origin: isProduction ? FRONTEND_URL : ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:5173'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie']
 }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
 app.use(session({
+  store: new FileStore({
+    path: './sessions',
+    ttl: 24 * 60 * 60, // 24 hours in seconds
+    reapInterval: 60 * 60 // Clean up expired sessions every hour
+  }),
   secret: process.env.SESSION_SECRET,
-  resave: false,
+  resave: true,
   saveUninitialized: false,
   cookie: {
-    secure: process.env.NODE_ENV === 'production' ? true : false, // only true for HTTPS
+    secure: isProduction, // Use secure cookies in production
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
-  }
+    sameSite: isProduction ? 'strict' : 'lax',
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+  },
+  name: 'spotify-session'
 }));
 
-app.get('/', (req, res) => {
-  res.send('Spotify Collector Backend Running');
-});
-
-app.get('/auth/login', (req, res) => {
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: SPOTIFY_CLIENT_ID,
-    scope: SCOPES,
-    redirect_uri: SPOTIFY_REDIRECT_URI,
-    show_dialog: 'true'
-  });
-  res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
-});
-
-app.get('/auth/callback', async (req, res) => {
-  const code = req.query.code || null;
-  if (!code) {
-    return res.redirect(`${FRONTEND_URI}/?error=missing_code`);
-  }
-  try {
-    const tokenRes = await axios.post('https://accounts.spotify.com/api/token',
-      querystring.stringify({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: SPOTIFY_REDIRECT_URI,
-        client_id: SPOTIFY_CLIENT_ID,
-        client_secret: SPOTIFY_CLIENT_SECRET
-      }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    req.session.access_token = tokenRes.data.access_token;
-    req.session.refresh_token = tokenRes.data.refresh_token;
-    res.redirect(`${FRONTEND_URI}/?auth=success`);
-  } catch (err) {
-    res.redirect(`${FRONTEND_URI}/?error=token_exchange_failed`);
-  }
-});
-
-// Helper middleware to check authentication
-function requireAuth(req, res, next) {
-  if (!req.session.access_token) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-  next();
+// Security headers for production
+if (isProduction) {
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'", "https://accounts.spotify.com", "https://api.spotify.com"],
+        fontSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        mediaSrc: ["'self'"],
+        frameSrc: ["'none'"],
+      },
+    },
+  }));
 }
 
-// Get user's playlists
-app.get('/api/playlists', requireAuth, async (req, res) => {
-  try {
-    const playlists = [];
-    let url = 'https://api.spotify.com/v1/me/playlists?limit=50';
-    while (url) {
-      const response = await axios.get(url, {
-        headers: { Authorization: `Bearer ${req.session.access_token}` }
-      });
-      playlists.push(...response.data.items.map(p => ({
-        id: p.id,
-        name: p.name
-      })));
-      url = response.data.next;
-    }
-    res.json({ playlists });
-  } catch (err) {
-    console.error('Error fetching playlists:', err.response ? err.response.data : err.message);
-    console.error('Session info:', req.session);
-    res.status(err.response?.status || 500).json({ error: 'Failed to fetch playlists', details: err.response?.data || err.message });
-  }
-});
+// Session debugging middleware (only in development)
+if (!isProduction) {
+  app.use((req, res, next) => {
+    console.log('=== SESSION MIDDLEWARE ===');
+    console.log('Request URL:', req.url);
+    console.log('Session ID:', req.sessionID);
+    console.log('Session exists:', !!req.session);
+    console.log('Session keys:', Object.keys(req.session || {}));
+    console.log('========================');
+    next();
+  });
+}
 
-// Get tracks for a playlist
-app.get('/api/playlists/:id/tracks', requireAuth, async (req, res) => {
-  const playlistId = req.params.id;
-  try {
-    const tracks = [];
-    let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
-    while (url) {
-      const response = await axios.get(url, {
-        headers: { Authorization: `Bearer ${req.session.access_token}` }
-      });
-      tracks.push(...response.data.items.map(item => {
-        const t = item.track;
-        return {
-          id: t.id,
-          title: t.name,
-          artists: t.artists.map(a => a.name)
-        };
-      }));
-      url = response.data.next;
-    }
-    res.json({ tracks });
-  } catch (err) {
-    console.error('Error fetching tracks:', err.response ? err.response.data : err.message);
-    console.error('Session info:', req.session);
-    res.status(err.response?.status || 500).json({ error: 'Failed to fetch tracks', details: err.response?.data || err.message });
+// Auth check middleware
+const requireAuth = (req, res, next) => {
+  if (!isProduction) {
+    console.log('=== AUTH CHECK DEBUG ===');
+    console.log('Session ID:', req.sessionID);
+    console.log('Session exists:', !!req.session);
+    console.log('Has access token:', !!req.session?.access_token);
+    console.log('========================');
   }
-});
+  
+  if (!req.session?.access_token) {
+    return res.status(401).json({ error: 'No access token' });
+  }
+  next();
+};
+
+// Helper to validate Spotify ID format
+function isValidSpotifyId(id) {
+  return typeof id === 'string' && /^[a-zA-Z0-9]{22}$/.test(id);
+}
+
+// Helper to sanitize error messages
+function sanitizeError(err) {
+  if (err.response?.status === 401) {
+    return 'Authentication failed. Please log in again.';
+  } else if (err.response?.status === 403) {
+    return 'Access denied. Please check your permissions.';
+  } else if (err.response?.status === 404) {
+    return 'Resource not found.';
+  } else if (err.response?.status >= 500) {
+    return 'Server error. Please try again later.';
+  }
+  return 'An error occurred. Please try again.';
+}
 
 // Helper to normalize text fields to NFC
 function normalizeText(str) {
@@ -193,6 +197,18 @@ const downloadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 10, // limit each IP to 10 download requests per windowMs
   message: 'Too many download requests from this IP, please try again later.'
+});
+
+const authLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 15 minutes
+  max: 25, // limit each IP to 5 auth requests per windowMs
+  message: 'Too many authentication requests from this IP, please try again later.'
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 API requests per windowMs
+  message: 'Too many API requests from this IP, please try again later.'
 });
 
 // Helper to sleep for ms milliseconds
@@ -291,6 +307,130 @@ async function fetchPlaylistsAndTracksBatched(accessToken, selection, batchSize 
   return { results: allResults, skippedTracks };
 }
 
+app.get('/', (req, res) => {
+  res.send('Spotify Collector Backend Running');
+});
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Authentication endpoints
+app.get('/auth/login', authLimiter, (req, res) => {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: SPOTIFY_CLIENT_ID,
+    scope: SCOPES,
+    redirect_uri: SPOTIFY_REDIRECT_URI,
+    show_dialog: 'true'
+  });
+  res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
+});
+
+app.get('/auth/callback', authLimiter, async (req, res) => {
+  const code = req.query.code || null;
+  if (!code) {
+    return res.redirect(`${FRONTEND_URL}/?error=missing_code`);
+  }
+  try {
+    const tokenRes = await axios.post('https://accounts.spotify.com/api/token',
+      querystring.stringify({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: SPOTIFY_REDIRECT_URI,
+        client_id: SPOTIFY_CLIENT_ID,
+        client_secret: SPOTIFY_CLIENT_SECRET
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    req.session.access_token = tokenRes.data.access_token;
+    req.session.refresh_token = tokenRes.data.refresh_token;
+    
+    // Explicitly save the session
+    req.session.save((err) => {
+      if (err) {
+        console.error('Session save error:', err);
+        return res.redirect(`${FRONTEND_URL}/?error=session_save_failed`);
+      }
+      if (!isProduction) {
+        console.log('=== CALLBACK SESSION DEBUG ===');
+        console.log('Session ID:', req.sessionID);
+        console.log('Session after setting tokens:', { 
+          sessionId: req.sessionID, 
+          hasAccessToken: !!req.session.access_token,
+          hasRefreshToken: !!req.session.refresh_token
+        });
+        console.log('=============================');
+      }
+      
+      console.log('Redirecting to frontend with session ID:', req.sessionID);
+      res.redirect(`${FRONTEND_URL}/?auth=success&sessionId=${req.sessionID}`);
+    });
+  } catch (err) {
+    console.error('Token exchange error:', err.response?.data || err.message);
+    res.redirect(`${FRONTEND_URL}/?error=token_exchange_failed`);
+  }
+});
+
+// Get user's playlists
+app.get('/api/playlists', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    const playlists = [];
+    let url = 'https://api.spotify.com/v1/me/playlists?limit=50';
+    while (url) {
+      const response = await axios.get(url, {
+        headers: { Authorization: `Bearer ${req.session.access_token}` }
+      });
+      playlists.push(...response.data.items.map(p => ({
+        id: p.id,
+        name: p.name
+      })));
+      url = response.data.next;
+    }
+    res.json({ playlists });
+  } catch (err) {
+    console.error('Error fetching playlists:', err.response ? err.response.data : err.message);
+    res.status(err.response?.status || 500).json({ error: sanitizeError(err) });
+  }
+});
+
+// Get tracks for a playlist
+app.get('/api/playlists/:id/tracks', requireAuth, apiLimiter, async (req, res) => {
+  const playlistId = req.params.id;
+  
+  // Validate playlist ID
+  if (!isValidSpotifyId(playlistId)) {
+    return res.status(400).json({ error: 'Invalid playlist ID' });
+  }
+  
+  try {
+    const tracks = [];
+    let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
+    while (url) {
+      const response = await axios.get(url, {
+        headers: { Authorization: `Bearer ${req.session.access_token}` }
+      });
+      tracks.push(...response.data.items.map(item => {
+        const t = item.track;
+        return {
+          id: t.id,
+          title: t.name,
+          artists: t.artists.map(a => a.name)
+        };
+      }));
+      url = response.data.next;
+    }
+    res.json({ tracks });
+  } catch (err) {
+    console.error('Error fetching tracks:', err.response ? err.response.data : err.message);
+    res.status(err.response?.status || 500).json({ error: sanitizeError(err) });
+  }
+});
+
 app.post(
   '/api/download',
   requireAuth,
@@ -305,8 +445,11 @@ app.post(
     for (const sel of selection) {
       if (
         typeof sel.playlistId !== 'string' ||
+        !isValidSpotifyId(sel.playlistId) ||
         !Array.isArray(sel.trackIds) ||
-        !sel.trackIds.every(id => typeof id === 'string' || id === null)
+        sel.trackIds.length === 0 ||
+        sel.trackIds.length > 10000 || // Limit to prevent abuse
+        !sel.trackIds.every(id => (typeof id === 'string' && isValidSpotifyId(id)) || id === null)
       ) {
         return res.status(400).json({ error: 'Invalid selection structure' });
       }
@@ -321,15 +464,83 @@ app.post(
     } catch (err) {
       // Add detailed logging
       console.error('Download error:', err.response?.data || err.message, err.stack);
-      res.status(500).json({ error: 'Failed to generate file', details: err.response?.data || err.message });
+      res.status(500).json({ error: sanitizeError(err) });
     }
   }
 );
 
-app.get('/debug/session', (req, res) => {
-  res.json({ session: req.session });
+// Simple session test endpoint (development only)
+if (!isProduction) {
+  app.get('/api/session-test', (req, res) => {
+    console.log('=== SESSION TEST ===');
+    console.log('Session ID:', req.sessionID);
+    console.log('Session exists:', !!req.session);
+    
+    // Set a test value
+    req.session.testValue = 'test-' + Date.now();
+    console.log('Set test value:', req.session.testValue);
+    
+    res.json({
+      sessionId: req.sessionID,
+      sessionExists: !!req.session,
+      testValue: req.session.testValue,
+      sessionKeys: Object.keys(req.session || {})
+    });
+  });
+}
+
+// Test endpoint to manually check session data by session ID (development only)
+if (!isProduction) {
+  app.get('/api/test-session/:sessionId', (req, res) => {
+    const sessionId = req.params.sessionId;
+    console.log('Testing session ID:', sessionId);
+    
+    // Try to get session directly from store
+    const sessionStore = req.sessionStore;
+    sessionStore.get(sessionId, (err, session) => {
+      if (err) {
+        console.error('Error getting session:', err);
+        return res.json({ error: 'Failed to get session', details: err.message });
+      }
+      console.log('Session from store:', session);
+      res.json({
+        sessionId,
+        sessionExists: !!session,
+        hasAccessToken: !!session?.access_token
+      });
+    });
+  });
+}
+
+app.get('/api/status', authLimiter, (req, res) => {
+  if (!isProduction) {
+    console.log('=== STATUS ENDPOINT DEBUG ===');
+    console.log('Session ID:', req.sessionID);
+    console.log('Session exists:', !!req.session);
+    console.log('Has access token:', !!req.session?.access_token);
+    console.log('============================');
+  }
+  
+  res.json({
+    authenticated: !!req.session?.access_token,
+    sessionId: req.sessionID,
+    hasAccessToken: !!req.session?.access_token,
+    hasRefreshToken: !!req.session?.refresh_token
+  });
+});
+
+// Handle 404 for unmatched routes
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not Found' });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal Server Error' });
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
