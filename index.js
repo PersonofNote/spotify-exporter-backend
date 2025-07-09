@@ -71,12 +71,12 @@ class UserQuotaTracker {
     return quota;
   }
 
-  checkApiLimit(userId, limit = 1000) {
+  checkApiLimit(userId, limit = 5000) {
     const quota = this.getUserQuota(userId);
     return quota.apiCalls < limit;
   }
 
-  checkDownloadLimit(userId, limit = 5) {
+  checkDownloadLimit(userId, limit = 20) {
     const quota = this.getUserQuota(userId);
     return quota.downloads < limit;
   }
@@ -86,9 +86,9 @@ class UserQuotaTracker {
     return {
       date: new Date().toISOString().split('T')[0],
       apiCalls: quota.apiCalls,
-      apiLimit: 1000,
+      apiLimit: 5000,
       downloads: quota.downloads,
-      downloadLimit: 5,
+      downloadLimit: 20,
       downloadedTracks: quota.downloadedTracks
     };
   }
@@ -337,10 +337,14 @@ const checkUserApiQuota = (req, res, next) => {
 
   if (!quotaTracker.checkApiLimit(req.session.user_id)) {
     const status = quotaTracker.getQuotaStatus(req.session.user_id);
+    if (!isProduction) {
+      console.log(`API quota exceeded for user ${req.session.user_id}: ${status.apiCalls}/${status.apiLimit}`);
+    }
     return res.status(429).json({ 
       error: 'Daily API limit exceeded', 
       quota: status,
-      resetTime: 'Midnight UTC'
+      resetTime: 'Midnight UTC',
+      message: `You've used ${status.apiCalls}/${status.apiLimit} API calls today. Limit resets at midnight UTC.`
     });
   }
 
@@ -354,10 +358,14 @@ const checkUserDownloadQuota = (req, res, next) => {
 
   if (!quotaTracker.checkDownloadLimit(req.session.user_id)) {
     const status = quotaTracker.getQuotaStatus(req.session.user_id);
+    if (!isProduction) {
+      console.log(`Download quota exceeded for user ${req.session.user_id}: ${status.downloads}/${status.downloadLimit}`);
+    }
     return res.status(429).json({ 
       error: 'Daily download limit exceeded', 
       quota: status,
-      resetTime: 'Midnight UTC'
+      resetTime: 'Midnight UTC',
+      message: `You've used ${status.downloads}/${status.downloadLimit} downloads today. Limit resets at midnight UTC.`
     });
   }
 
@@ -910,6 +918,24 @@ app.get('/api/quota', requireAuth, (req, res) => {
   const quota = quotaTracker.getQuotaStatus(req.session.user_id);
   res.json(quota);
 });
+
+// Debug quota endpoint (development only)
+if (!isProduction) {
+  app.get('/api/debug-quota', requireAuth, (req, res) => {
+    const quota = quotaTracker.getQuotaStatus(req.session.user_id);
+    const apiLimitOk = quotaTracker.checkApiLimit(req.session.user_id);
+    const downloadLimitOk = quotaTracker.checkDownloadLimit(req.session.user_id);
+    
+    res.json({
+      userId: req.session.user_id,
+      quota,
+      apiLimitOk,
+      downloadLimitOk,
+      apiCallsRemaining: quota.apiLimit - quota.apiCalls,
+      downloadsRemaining: quota.downloadLimit - quota.downloads
+    });
+  });
+}
 
 // Handle 404 for unmatched routes
 app.use((req, res) => {
