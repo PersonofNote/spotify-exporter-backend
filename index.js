@@ -34,7 +34,7 @@ const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI;
 const isProduction = process.env.NODE_ENV === 'production';
-const FRONTEND_URL = isProduction ? process.env.FRONTEND_URL || 'https://yourdomain.com' : 'http://localhost:5173';
+const FRONTEND_URL = isProduction ? process.env.FRONTEND_URL || 'https://yourdomain.com' : 'http://127.0.0.1:5173';
 
 // Validate production configuration
 if (isProduction && (!process.env.FRONTEND_URL || !process.env.FRONTEND_URL.startsWith('https://'))) {
@@ -49,10 +49,12 @@ const SCOPES = [
 ].join(' ');
 
 app.use(cors({
-  origin: isProduction ? FRONTEND_URL : ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:5173'],
+  origin: isProduction ? FRONTEND_URL : ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:5173', 'http://127.0.0.1:3001'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+  exposedHeaders: ['Set-Cookie'], // Allow frontend to see Set-Cookie header
+  optionsSuccessStatus: 200 // Support legacy browsers
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
@@ -64,13 +66,16 @@ app.use(session({
     reapInterval: 60 * 60 // Clean up expired sessions every hour
   }),
   secret: process.env.SESSION_SECRET,
-  resave: true,
+  resave: false, // Don't save session if unmodified
   saveUninitialized: false,
+  rolling: true, // Reset expiration on activity
   cookie: {
     secure: isProduction, // Use secure cookies in production
     httpOnly: true,
     sameSite: isProduction ? 'strict' : 'lax',
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    path: '/' // Ensure cookie is available for all paths
+    // Don't set domain - let it default to the request domain
   },
   name: 'spotify-session'
 }));
@@ -111,14 +116,20 @@ if (!isProduction) {
 const requireAuth = (req, res, next) => {
   if (!isProduction) {
     console.log('=== AUTH CHECK DEBUG ===');
+    console.log('URL:', req.url);
     console.log('Session ID:', req.sessionID);
     console.log('Session exists:', !!req.session);
     console.log('Has access token:', !!req.session?.access_token);
+    console.log('Cookie header:', req.headers.cookie);
     console.log('========================');
   }
   
   if (!req.session?.access_token) {
-    return res.status(401).json({ error: 'No access token' });
+    return res.status(401).json({ 
+      error: 'Authentication required',
+      sessionId: req.sessionID,
+      hasSession: !!req.session
+    });
   }
   next();
 };
@@ -331,11 +342,21 @@ app.get('/auth/login', authLimiter, (req, res) => {
   res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
 });
 
-app.get('/auth/callback', authLimiter, async (req, res) => {
-  const code = req.query.code || null;
+// Handle token exchange from frontend (POST request with code)
+app.post('/auth/exchange', authLimiter, async (req, res) => {
+  const { code } = req.body;
   if (!code) {
-    return res.redirect(`${FRONTEND_URL}/?error=missing_code`);
+    return res.status(400).json({ error: 'Missing authorization code' });
   }
+  
+  if (!isProduction) {
+    console.log('=== TOKEN EXCHANGE START ===');
+    console.log('Session ID before token exchange:', req.sessionID);
+    console.log('Session exists:', !!req.session);
+    console.log('Authorization code received from frontend');
+    console.log('=============================');
+  }
+  
   try {
     const tokenRes = await axios.post('https://accounts.spotify.com/api/token',
       querystring.stringify({
@@ -347,6 +368,11 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
+    
+    if (!isProduction) {
+      console.log('Token exchange successful');
+    }
+    
     req.session.access_token = tokenRes.data.access_token;
     req.session.refresh_token = tokenRes.data.refresh_token;
     
@@ -354,26 +380,48 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
     req.session.save((err) => {
       if (err) {
         console.error('Session save error:', err);
-        return res.redirect(`${FRONTEND_URL}/?error=session_save_failed`);
+        return res.status(500).json({ error: 'Session save failed' });
       }
       if (!isProduction) {
-        console.log('=== CALLBACK SESSION DEBUG ===');
-        console.log('Session ID:', req.sessionID);
+        console.log('=== TOKEN EXCHANGE SESSION DEBUG ===');
+        console.log('Session ID after save:', req.sessionID);
         console.log('Session after setting tokens:', { 
           sessionId: req.sessionID, 
           hasAccessToken: !!req.session.access_token,
           hasRefreshToken: !!req.session.refresh_token
         });
-        console.log('=============================');
+        console.log('Cookie will be set with name:', 'spotify-session');
+        console.log('Cookie path:', req.session.cookie.path);
+        console.log('Cookie secure:', req.session.cookie.secure);
+        console.log('Cookie httpOnly:', req.session.cookie.httpOnly);
+        console.log('Cookie sameSite:', req.session.cookie.sameSite);
+        console.log('====================================');
       }
       
-      console.log('Redirecting to frontend with session ID:', req.sessionID);
-      res.redirect(`${FRONTEND_URL}/?auth=success&sessionId=${req.sessionID}`);
+      res.json({ 
+        success: true, 
+        authenticated: true,
+        sessionId: req.sessionID 
+      });
     });
   } catch (err) {
     console.error('Token exchange error:', err.response?.data || err.message);
-    res.redirect(`${FRONTEND_URL}/?error=token_exchange_failed`);
+    res.status(400).json({ 
+      error: 'Token exchange failed', 
+      details: err.response?.data || err.message 
+    });
   }
+});
+
+// Legacy callback endpoint (keep for backward compatibility)
+app.get('/auth/callback', authLimiter, async (req, res) => {
+  const code = req.query.code || null;
+  if (!code) {
+    return res.redirect(`${FRONTEND_URL}/?error=missing_code`);
+  }
+  
+  // Redirect to frontend with the code so it can handle the exchange
+  res.redirect(`${FRONTEND_URL}/auth/callback?code=${encodeURIComponent(code)}`);
 });
 
 // Get user's playlists
@@ -510,6 +558,29 @@ if (!isProduction) {
       });
     });
   });
+
+  // Cookie debugging endpoint
+  app.get('/api/debug-cookies', (req, res) => {
+    console.log('=== COOKIE DEBUG ===');
+    console.log('Current session ID:', req.sessionID);
+    console.log('Session exists:', !!req.session);
+    console.log('Has access token:', !!req.session?.access_token);
+    console.log('All request headers:', req.headers);
+    console.log('Parsed cookies:', req.cookies);
+    console.log('Raw cookie header:', req.headers.cookie);
+    console.log('==================');
+    
+    res.json({
+      sessionId: req.sessionID,
+      sessionExists: !!req.session,
+      hasAccessToken: !!req.session?.access_token,
+      cookies: req.cookies,
+      rawCookieHeader: req.headers.cookie,
+      userAgent: req.headers['user-agent'],
+      origin: req.headers.origin,
+      referer: req.headers.referer
+    });
+  });
 }
 
 app.get('/api/status', authLimiter, (req, res) => {
@@ -518,11 +589,14 @@ app.get('/api/status', authLimiter, (req, res) => {
     console.log('Session ID:', req.sessionID);
     console.log('Session exists:', !!req.session);
     console.log('Has access token:', !!req.session?.access_token);
+    console.log('Headers:', req.headers.cookie);
     console.log('============================');
   }
   
+  const isAuthenticated = !!req.session?.access_token;
+  
   res.json({
-    authenticated: !!req.session?.access_token,
+    authenticated: isAuthenticated,
     sessionId: req.sessionID,
     hasAccessToken: !!req.session?.access_token,
     hasRefreshToken: !!req.session?.refresh_token

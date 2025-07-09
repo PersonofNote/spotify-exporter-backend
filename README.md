@@ -25,6 +25,7 @@ This is the backend server for the Spotify Collect application that allows users
    ```
    Edit `.env` file with your actual values:
    - Get Spotify API credentials from [Spotify Developer Dashboard](https://developer.spotify.com/dashboard/applications)
+   - Set redirect URI in Spotify app to: `http://127.0.0.1:5173/auth/callback` (for development)
    - Generate a secure session secret (32+ characters)
    - Set appropriate URLs for your deployment
 
