@@ -12,6 +12,112 @@ const FileStore = require('session-file-store')(session);
 const path = require('path');
 const fs = require('fs');
 
+// User quota tracking
+class UserQuotaTracker {
+  constructor() {
+    this.quotaFile = './user-quotas.json';
+    this.quotas = this.loadQuotas();
+    this.saveInterval = setInterval(() => this.saveQuotas(), 5 * 60 * 1000); // Save every 5 minutes
+  }
+
+  loadQuotas() {
+    try {
+      if (fs.existsSync(this.quotaFile)) {
+        const data = fs.readFileSync(this.quotaFile, 'utf8');
+        return JSON.parse(data);
+      }
+    } catch (error) {
+      console.error('Error loading quotas:', error);
+    }
+    return {};
+  }
+
+  saveQuotas() {
+    try {
+      fs.writeFileSync(this.quotaFile, JSON.stringify(this.quotas, null, 2));
+    } catch (error) {
+      console.error('Error saving quotas:', error);
+    }
+  }
+
+  getUserQuota(userId) {
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    
+    if (!this.quotas[userId]) {
+      this.quotas[userId] = {};
+    }
+    
+    if (!this.quotas[userId][today]) {
+      this.quotas[userId][today] = {
+        apiCalls: 0,
+        downloads: 0,
+        downloadedTracks: 0
+      };
+    }
+    
+    return this.quotas[userId][today];
+  }
+
+  incrementApiCalls(userId, count = 1) {
+    const quota = this.getUserQuota(userId);
+    quota.apiCalls += count;
+    return quota.apiCalls;
+  }
+
+  incrementDownloads(userId, trackCount = 0) {
+    const quota = this.getUserQuota(userId);
+    quota.downloads += 1;
+    quota.downloadedTracks += trackCount;
+    return quota;
+  }
+
+  checkApiLimit(userId, limit = 1000) {
+    const quota = this.getUserQuota(userId);
+    return quota.apiCalls < limit;
+  }
+
+  checkDownloadLimit(userId, limit = 5) {
+    const quota = this.getUserQuota(userId);
+    return quota.downloads < limit;
+  }
+
+  getQuotaStatus(userId) {
+    const quota = this.getUserQuota(userId);
+    return {
+      date: new Date().toISOString().split('T')[0],
+      apiCalls: quota.apiCalls,
+      apiLimit: 1000,
+      downloads: quota.downloads,
+      downloadLimit: 5,
+      downloadedTracks: quota.downloadedTracks
+    };
+  }
+
+  // Clean up old quota data (keep last 7 days)
+  cleanupOldQuotas() {
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const cutoffDate = sevenDaysAgo.toISOString().split('T')[0];
+
+    for (const userId in this.quotas) {
+      for (const date in this.quotas[userId]) {
+        if (date < cutoffDate) {
+          delete this.quotas[userId][date];
+        }
+      }
+      // Remove users with no recent activity
+      if (Object.keys(this.quotas[userId]).length === 0) {
+        delete this.quotas[userId];
+      }
+    }
+  }
+}
+
+const quotaTracker = new UserQuotaTracker();
+
+// Clean up old quotas daily
+setInterval(() => quotaTracker.cleanupOldQuotas(), 24 * 60 * 60 * 1000);
+
 // Environment variable validation
 const requiredEnvVars = [
   'SPOTIFY_CLIENT_ID',
@@ -204,6 +310,7 @@ function generateFile(data, format) {
   throw new Error('Unsupported format');
 }
 
+// IP-based rate limiters (for unauthenticated requests)
 const downloadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 10, // limit each IP to 10 download requests per windowMs
@@ -211,8 +318,8 @@ const downloadLimiter = rateLimit({
 });
 
 const authLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000, // 15 minutes
-  max: 25, // limit each IP to 5 auth requests per windowMs
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 25, // limit each IP to 25 auth requests per windowMs
   message: 'Too many authentication requests from this IP, please try again later.'
 });
 
@@ -221,6 +328,41 @@ const apiLimiter = rateLimit({
   max: 100, // limit each IP to 100 API requests per windowMs
   message: 'Too many API requests from this IP, please try again later.'
 });
+
+// User-based quota middleware
+const checkUserApiQuota = (req, res, next) => {
+  if (!req.session?.user_id) {
+    return res.status(401).json({ error: 'User not authenticated' });
+  }
+
+  if (!quotaTracker.checkApiLimit(req.session.user_id)) {
+    const status = quotaTracker.getQuotaStatus(req.session.user_id);
+    return res.status(429).json({ 
+      error: 'Daily API limit exceeded', 
+      quota: status,
+      resetTime: 'Midnight UTC'
+    });
+  }
+
+  next();
+};
+
+const checkUserDownloadQuota = (req, res, next) => {
+  if (!req.session?.user_id) {
+    return res.status(401).json({ error: 'User not authenticated' });
+  }
+
+  if (!quotaTracker.checkDownloadLimit(req.session.user_id)) {
+    const status = quotaTracker.getQuotaStatus(req.session.user_id);
+    return res.status(429).json({ 
+      error: 'Daily download limit exceeded', 
+      quota: status,
+      resetTime: 'Midnight UTC'
+    });
+  }
+
+  next();
+};
 
 // Helper to sleep for ms milliseconds
 function sleep(ms) {
@@ -318,6 +460,82 @@ async function fetchPlaylistsAndTracksBatched(accessToken, selection, batchSize 
   return { results: allResults, skippedTracks };
 }
 
+// Updated fetchPlaylistsAndTracks with API call tracking
+async function fetchPlaylistsAndTracksBatchedWithTracking(accessToken, selection, batchSize = 1000, delayMs = 500, userId) {
+  // selection: [{ playlistId, trackIds: [trackId, ...] }]
+  const batches = chunkArray(selection, batchSize);
+  let allResults = [];
+  let skippedTracks = [];
+  let totalApiCalls = 0;
+  
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const batchResults = [];
+    for (const sel of batch) {
+      // Fetch playlist metadata
+      const plRes = await axios.get(`https://api.spotify.com/v1/playlists/${sel.playlistId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      totalApiCalls++;
+      const pl = plRes.data;
+      
+      // Fetch all tracks for this playlist (handle pagination)
+      let tracks = [];
+      let url = `https://api.spotify.com/v1/playlists/${sel.playlistId}/tracks?limit=100`;
+      while (url) {
+        const trRes = await axios.get(url, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        totalApiCalls++;
+        tracks = tracks.concat(trRes.data.items.map(item => item.track));
+        url = trRes.data.next;
+      }
+      
+      // Filter tracks to only those selected, skip null track IDs
+      const selectedTracks = [];
+      for (const trackId of sel.trackIds) {
+        if (trackId === null) {
+          // Find the track in the playlist to get its title
+          const track = tracks.find(t => t && t.id === null);
+          if (track) {
+            skippedTracks.push({
+              playlistName: pl.name,
+              title: track.name,
+              reason: 'null_track_id'
+            });
+          }
+          continue;
+        }
+        const track = tracks.find(t => t && t.id === trackId);
+        if (track) {
+          selectedTracks.push({
+            id: track.id,
+            title: track.name,
+            artists: (track.artists || []).map(a => a.name)
+          });
+        } else {
+          // Track not found in playlist
+          skippedTracks.push({
+            playlistName: pl.name,
+            title: `Unknown track (ID: ${trackId})`,
+            reason: 'track_not_found'
+          });
+        }
+      }
+      batchResults.push({
+        id: pl.id,
+        name: pl.name,
+        tracks: selectedTracks
+      });
+    }
+    allResults = allResults.concat(batchResults);
+    if (i < batches.length - 1) {
+      await sleep(delayMs); // Wait before next batch
+    }
+  }
+  return { results: allResults, skippedTracks, apiCallCount: totalApiCalls };
+}
+
 app.get('/', (req, res) => {
   res.send('Spotify Collector Backend Running');
 });
@@ -376,6 +594,22 @@ app.post('/auth/exchange', authLimiter, async (req, res) => {
     req.session.access_token = tokenRes.data.access_token;
     req.session.refresh_token = tokenRes.data.refresh_token;
     
+    // Get user info from Spotify to store user ID
+    try {
+      const userResponse = await axios.get('https://api.spotify.com/v1/me', {
+        headers: { Authorization: `Bearer ${tokenRes.data.access_token}` }
+      });
+      
+      req.session.user_id = userResponse.data.id;
+      
+      if (!isProduction) {
+        console.log('User authenticated:', userResponse.data.id);
+      }
+    } catch (userErr) {
+      console.error('Failed to get user info:', userErr.response?.data || userErr.message);
+      return res.status(500).json({ error: 'Failed to get user information' });
+    }
+    
     // Explicitly save the session
     req.session.save((err) => {
       if (err) {
@@ -387,6 +621,7 @@ app.post('/auth/exchange', authLimiter, async (req, res) => {
         console.log('Session ID after save:', req.sessionID);
         console.log('Session after setting tokens:', { 
           sessionId: req.sessionID, 
+          userId: req.session.user_id,
           hasAccessToken: !!req.session.access_token,
           hasRefreshToken: !!req.session.refresh_token
         });
@@ -398,10 +633,14 @@ app.post('/auth/exchange', authLimiter, async (req, res) => {
         console.log('====================================');
       }
       
+      // Get user's quota status
+      const quotaStatus = quotaTracker.getQuotaStatus(req.session.user_id);
+      
       res.json({ 
         success: true, 
         authenticated: true,
-        sessionId: req.sessionID 
+        sessionId: req.sessionID,
+        quota: quotaStatus
       });
     });
   } catch (err) {
@@ -425,21 +664,36 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
 });
 
 // Get user's playlists
-app.get('/api/playlists', requireAuth, apiLimiter, async (req, res) => {
+app.get('/api/playlists', requireAuth, checkUserApiQuota, apiLimiter, async (req, res) => {
   try {
     const playlists = [];
     let url = 'https://api.spotify.com/v1/me/playlists?limit=50';
+    let apiCallCount = 0;
+    
     while (url) {
       const response = await axios.get(url, {
         headers: { Authorization: `Bearer ${req.session.access_token}` }
       });
+      apiCallCount++;
+      
       playlists.push(...response.data.items.map(p => ({
         id: p.id,
         name: p.name
       })));
       url = response.data.next;
     }
-    res.json({ playlists });
+    
+    // Track API usage
+    quotaTracker.incrementApiCalls(req.session.user_id, apiCallCount);
+    
+    if (!isProduction) {
+      console.log(`User ${req.session.user_id} made ${apiCallCount} API calls for playlists`);
+    }
+    
+    res.json({ 
+      playlists,
+      quota: quotaTracker.getQuotaStatus(req.session.user_id)
+    });
   } catch (err) {
     console.error('Error fetching playlists:', err.response ? err.response.data : err.message);
     res.status(err.response?.status || 500).json({ error: sanitizeError(err) });
@@ -447,7 +701,7 @@ app.get('/api/playlists', requireAuth, apiLimiter, async (req, res) => {
 });
 
 // Get tracks for a playlist
-app.get('/api/playlists/:id/tracks', requireAuth, apiLimiter, async (req, res) => {
+app.get('/api/playlists/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter, async (req, res) => {
   const playlistId = req.params.id;
   
   // Validate playlist ID
@@ -458,10 +712,14 @@ app.get('/api/playlists/:id/tracks', requireAuth, apiLimiter, async (req, res) =
   try {
     const tracks = [];
     let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
+    let apiCallCount = 0;
+    
     while (url) {
       const response = await axios.get(url, {
         headers: { Authorization: `Bearer ${req.session.access_token}` }
       });
+      apiCallCount++;
+      
       tracks.push(...response.data.items.map(item => {
         const t = item.track;
         return {
@@ -472,7 +730,18 @@ app.get('/api/playlists/:id/tracks', requireAuth, apiLimiter, async (req, res) =
       }));
       url = response.data.next;
     }
-    res.json({ tracks });
+    
+    // Track API usage
+    quotaTracker.incrementApiCalls(req.session.user_id, apiCallCount);
+    
+    if (!isProduction) {
+      console.log(`User ${req.session.user_id} made ${apiCallCount} API calls for playlist ${playlistId}`);
+    }
+    
+    res.json({ 
+      tracks,
+      quota: quotaTracker.getQuotaStatus(req.session.user_id)
+    });
   } catch (err) {
     console.error('Error fetching tracks:', err.response ? err.response.data : err.message);
     res.status(err.response?.status || 500).json({ error: sanitizeError(err) });
@@ -482,6 +751,8 @@ app.get('/api/playlists/:id/tracks', requireAuth, apiLimiter, async (req, res) =
 app.post(
   '/api/download',
   requireAuth,
+  checkUserDownloadQuota,
+  checkUserApiQuota,
   downloadLimiter,
   express.json({ limit: '1mb' }),
   async (req, res) => {
@@ -489,6 +760,10 @@ app.post(
     if (!selection || !Array.isArray(selection) || !format) {
       return res.status(400).json({ error: 'Missing selection or format' });
     }
+    
+    // Count total tracks to be downloaded
+    const totalTracks = selection.reduce((sum, sel) => sum + (sel.trackIds?.length || 0), 0);
+    
     // Validate selection structure
     for (const sel of selection) {
       if (
@@ -502,12 +777,31 @@ app.post(
         return res.status(400).json({ error: 'Invalid selection structure' });
       }
     }
+    
     try {
-      const { results: data, skippedTracks } = await fetchPlaylistsAndTracksBatched(req.session.access_token, selection, 1000, 500);
+      // Track the download before processing (to prevent circumvention)
+      quotaTracker.incrementDownloads(req.session.user_id, totalTracks);
+      
+      const { results: data, skippedTracks, apiCallCount } = await fetchPlaylistsAndTracksBatchedWithTracking(
+        req.session.access_token, 
+        selection, 
+        1000, 
+        500,
+        req.session.user_id
+      );
+      
+      // Track API usage from the batch operation
+      quotaTracker.incrementApiCalls(req.session.user_id, apiCallCount);
+      
+      if (!isProduction) {
+        console.log(`User ${req.session.user_id} downloaded ${totalTracks} tracks using ${apiCallCount} API calls`);
+      }
+      
       const { content, type } = generateFile(data, format);
       res.setHeader('Content-Disposition', `attachment; filename=spotify_export.${format}`);
       res.setHeader('Content-Type', type);
       res.setHeader('X-Skipped-Tracks', JSON.stringify(skippedTracks));
+      res.setHeader('X-User-Quota', JSON.stringify(quotaTracker.getQuotaStatus(req.session.user_id)));
       res.send(content);
     } catch (err) {
       // Add detailed logging
@@ -589,18 +883,32 @@ app.get('/api/status', authLimiter, (req, res) => {
     console.log('Session ID:', req.sessionID);
     console.log('Session exists:', !!req.session);
     console.log('Has access token:', !!req.session?.access_token);
+    console.log('User ID:', req.session?.user_id);
     console.log('Headers:', req.headers.cookie);
     console.log('============================');
   }
   
   const isAuthenticated = !!req.session?.access_token;
   
+  let quota = null;
+  if (isAuthenticated && req.session.user_id) {
+    quota = quotaTracker.getQuotaStatus(req.session.user_id);
+  }
+  
   res.json({
     authenticated: isAuthenticated,
     sessionId: req.sessionID,
     hasAccessToken: !!req.session?.access_token,
-    hasRefreshToken: !!req.session?.refresh_token
+    hasRefreshToken: !!req.session?.refresh_token,
+    userId: req.session?.user_id,
+    quota: quota
   });
+});
+
+// Get user quota information
+app.get('/api/quota', requireAuth, (req, res) => {
+  const quota = quotaTracker.getQuotaStatus(req.session.user_id);
+  res.json(quota);
 });
 
 // Handle 404 for unmatched routes
@@ -614,7 +922,29 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal Server Error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`Server running on http://127.0.0.1:${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('User quota tracking enabled');
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\nShutting down gracefully...');
+  quotaTracker.saveQuotas();
+  clearInterval(quotaTracker.saveInterval);
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGTERM', () => {
+  console.log('\nShutting down gracefully...');
+  quotaTracker.saveQuotas();
+  clearInterval(quotaTracker.saveInterval);
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });
