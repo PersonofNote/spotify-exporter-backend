@@ -948,10 +948,8 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal Server Error' });
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`Server running on http://127.0.0.1:${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log('User quota tracking enabled');
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on http://0.0.0.0:${PORT}`);
 });
 
 // Graceful shutdown
