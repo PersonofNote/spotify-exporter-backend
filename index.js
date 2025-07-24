@@ -570,8 +570,8 @@ app.get('/auth', authLimiter, (req, res) => {
   res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
 });
 
-// Handle token exchange from frontend (POST request with code)
-app.post('/auth/exchange', authLimiter, async (req, res) => {
+// Handle token exchange
+app.post('/auth/callback', authLimiter, async (req, res) => {
   const { code } = req.body;
   if (!code) {
     return res.status(400).json({ error: 'Missing authorization code' });
@@ -660,17 +660,6 @@ app.post('/auth/exchange', authLimiter, async (req, res) => {
       details: err.response?.data || err.message 
     });
   }
-});
-
-// Legacy callback endpoint (keep for backward compatibility)
-app.get('/auth/callback', authLimiter, async (req, res) => {
-  const code = req.query.code || null;
-  if (!code) {
-    return res.redirect(`${FRONTEND_URL}/?error=missing_code`);
-  }
-  
-  // Redirect to frontend with the code so it can handle the exchange
-  res.redirect(`${FRONTEND_URL}/auth/callback?code=${encodeURIComponent(code)}`);
 });
 
 // Get user's playlists
