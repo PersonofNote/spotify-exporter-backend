@@ -571,20 +571,13 @@ app.get('/auth', authLimiter, (req, res) => {
 });
 
 // Handle token exchange
-app.post('/auth/callback', authLimiter, async (req, res) => {
-  const { code } = req.body;
+app.get('/auth/callback', authLimiter, async (req, res) => {
+  const code = req.query.code;
+
   if (!code) {
-    return res.status(400).json({ error: 'Missing authorization code' });
+    return res.redirect(`${FRONTEND_URL}/?error=missing_code`);
   }
-  
-  if (!isProduction) {
-    console.log('=== TOKEN EXCHANGE START ===');
-    console.log('Session ID before token exchange:', req.sessionID);
-    console.log('Session exists:', !!req.session);
-    console.log('Authorization code received from frontend');
-    console.log('=============================');
-  }
-  
+
   try {
     const tokenRes = await axios.post('https://accounts.spotify.com/api/token',
       querystring.stringify({
@@ -596,71 +589,39 @@ app.post('/auth/callback', authLimiter, async (req, res) => {
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
-    
-    if (!isProduction) {
-      console.log('Token exchange successful');
-    }
-    
-    req.session.access_token = tokenRes.data.access_token;
-    req.session.refresh_token = tokenRes.data.refresh_token;
-    
-    // Get user info from Spotify to store user ID
-    try {
-      const userResponse = await axios.get('https://api.spotify.com/v1/me', {
-        headers: { Authorization: `Bearer ${tokenRes.data.access_token}` }
-      });
-      
-      req.session.user_id = userResponse.data.id;
-      
-      if (!isProduction) {
-        console.log('User authenticated:', userResponse.data.id);
-      }
-    } catch (userErr) {
-      console.error('Failed to get user info:', userErr.response?.data || userErr.message);
-      return res.status(500).json({ error: 'Failed to get user information' });
-    }
-    
-    // Explicitly save the session
+
+    const access_token = tokenRes.data.access_token;
+    const refresh_token = tokenRes.data.refresh_token;
+
+    const userRes = await axios.get('https://api.spotify.com/v1/me', {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+
+    const user_id = userRes.data.id;
+
+    // Set session values
+    req.session.access_token = access_token;
+    req.session.refresh_token = refresh_token;
+    req.session.user_id = user_id;
+
+    // Save session and redirect
     req.session.save((err) => {
       if (err) {
-        console.error('Session save error:', err);
-        return res.status(500).json({ error: 'Session save failed' });
+        console.error('Session save failed:', err);
+        return res.redirect(`${FRONTEND_URL}/?error=session_save_failed`);
       }
-      if (!isProduction) {
-        console.log('=== TOKEN EXCHANGE SESSION DEBUG ===');
-        console.log('Session ID after save:', req.sessionID);
-        console.log('Session after setting tokens:', { 
-          sessionId: req.sessionID, 
-          userId: req.session.user_id,
-          hasAccessToken: !!req.session.access_token,
-          hasRefreshToken: !!req.session.refresh_token
-        });
-        console.log('Cookie will be set with name:', 'spotify-session');
-        console.log('Cookie path:', req.session.cookie.path);
-        console.log('Cookie secure:', req.session.cookie.secure);
-        console.log('Cookie httpOnly:', req.session.cookie.httpOnly);
-        console.log('Cookie sameSite:', req.session.cookie.sameSite);
-        console.log('====================================');
-      }
-      
-      // Get user's quota status
-      const quotaStatus = quotaTracker.getQuotaStatus(req.session.user_id);
-      
-      res.json({ 
-        success: true, 
-        authenticated: true,
-        sessionId: req.sessionID,
-        quota: quotaStatus
-      });
+
+      // Optionally pass session info via query or just reload app state
+      res.redirect(`${FRONTEND_URL}/?login=success`);
     });
+
   } catch (err) {
-    console.error('Token exchange error:', err.response?.data || err.message);
-    res.status(400).json({ 
-      error: 'Token exchange failed', 
-      details: err.response?.data || err.message 
-    });
+    console.error('Auth callback error:', err.response?.data || err.message);
+    res.redirect(`${FRONTEND_URL}/?error=auth_failed`);
   }
 });
+
+
 
 // Get user's playlists
 app.get('/api/playlists', requireAuth, checkUserApiQuota, apiLimiter, async (req, res) => {
