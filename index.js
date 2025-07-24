@@ -470,6 +470,7 @@ async function fetchPlaylistsAndTracksBatched(accessToken, selection, batchSize 
   return { results: allResults, skippedTracks };
 }
 
+
 // Updated fetchPlaylistsAndTracks with API call tracking
 async function fetchPlaylistsAndTracksBatchedWithTracking(accessToken, selection, batchSize = 1000, delayMs = 500, userId) {
   // selection: [{ playlistId, trackIds: [trackId, ...] }]
@@ -559,7 +560,7 @@ app.get('/health', (req, res) => {
 });
 
 // Authentication endpoints
-app.get('/auth', authLimiter, (req, res) => {
+app.get('/auth', (req, res) => {
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: SPOTIFY_CLIENT_ID,
@@ -575,53 +576,67 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
   const code = req.query.code;
 
   if (!code) {
-    return res.redirect(`${FRONTEND_URL}/?error=missing_code`);
+    return res.send(`
+      <script>
+        window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Missing authorization code' }, window.location.origin);
+        window.close();
+      </script>
+    `);
   }
 
   try {
-    const tokenRes = await axios.post('https://accounts.spotify.com/api/token',
-      querystring.stringify({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: SPOTIFY_REDIRECT_URI,
-        client_id: SPOTIFY_CLIENT_ID,
-        client_secret: SPOTIFY_CLIENT_SECRET
-      }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
+    // Exchange code for tokens (your existing logic)
+    const tokenRes = await axios.post('https://accounts.spotify.com/api/token', querystring.stringify({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: SPOTIFY_REDIRECT_URI,
+      client_id: SPOTIFY_CLIENT_ID,
+      client_secret: SPOTIFY_CLIENT_SECRET
+    }), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
 
     const access_token = tokenRes.data.access_token;
     const refresh_token = tokenRes.data.refresh_token;
 
+    // Get user info
     const userRes = await axios.get('https://api.spotify.com/v1/me', {
       headers: { Authorization: `Bearer ${access_token}` }
     });
-
     const user_id = userRes.data.id;
 
-    // Set session values
+    // Save tokens in session
     req.session.access_token = access_token;
     req.session.refresh_token = refresh_token;
     req.session.user_id = user_id;
 
-    // Save session and redirect
     req.session.save((err) => {
       if (err) {
-        console.error('Session save failed:', err);
-        return res.redirect(`${FRONTEND_URL}/?error=session_save_failed`);
+        return res.send(`
+          <script>
+            window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Session save failed' }, window.location.origin);
+            window.close();
+          </script>
+        `);
       }
 
-      // Optionally pass session info via query or just reload app state
-      res.redirect(`${FRONTEND_URL}/?login=success`);
+      // On success, post success message and close popup
+      res.send(`
+        <script>
+          window.opener.postMessage({ type: 'spotify-auth-success', userId: ${JSON.stringify(user_id)} }, window.location.origin);
+          window.close();
+        </script>
+      `);
     });
 
   } catch (err) {
     console.error('Auth callback error:', err.response?.data || err.message);
-    res.redirect(`${FRONTEND_URL}/?error=auth_failed`);
+    res.send(`
+      <script>
+        window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Authentication failed' }, window.location.origin);
+        window.close();
+      </script>
+    `);
   }
 });
-
-
 
 // Get user's playlists
 app.get('/api/playlists', requireAuth, checkUserApiQuota, apiLimiter, async (req, res) => {
