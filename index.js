@@ -135,6 +135,7 @@ for (const envVar of requiredEnvVars) {
 }
 
 const app = express();
+app.set('trust proxy', 1); // Trust first proxy for secure cookies in production
 const PORT = process.env.PORT || 3001;
 
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
