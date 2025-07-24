@@ -9,3 +9,5 @@ yarn-error.log*
 sessions/
 
 node_modules
+
+.DS_Store
