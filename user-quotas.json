@@ -1,9 +1,19 @@
 {
   "3o07llzkaoubom0lrdycbpzz5": {
-    "2025-07-09": {
-      "apiCalls": 128,
-      "downloads": 1,
-      "downloadedTracks": 20
+    "2025-07-17": {
+      "apiCalls": 115,
+      "downloads": 0,
+      "downloadedTracks": 0
+    },
+    "2025-07-18": {
+      "apiCalls": 0,
+      "downloads": 0,
+      "downloadedTracks": 0
+    },
+    "2025-07-24": {
+      "apiCalls": 63,
+      "downloads": 0,
+      "downloadedTracks": 0
     }
   }
 }
