@@ -1,3 +1,4 @@
+console.log('🚀 Fresh build deployed at', new Date().toISOString());
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
