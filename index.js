@@ -159,8 +159,8 @@ app.use(cors({
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
-  exposedHeaders: ['Set-Cookie'], // Allow frontend to see Set-Cookie header
-  optionsSuccessStatus: 200 // Support legacy browsers
+  exposedHeaders: ['Set-Cookie'],
+  optionsSuccessStatus: 200
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
@@ -557,7 +557,7 @@ app.get('/health', (req, res) => {
 });
 
 // Authentication endpoints
-app.get('/auth/login', authLimiter, (req, res) => {
+app.get('/auth', authLimiter, (req, res) => {
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: SPOTIFY_CLIENT_ID,
