@@ -572,20 +572,18 @@ app.get('/auth', (req, res) => {
 });
 
 // Handle token exchange
+const STATIC_DIR = path.join(__dirname, 'public');
+app.use(express.static(STATIC_DIR));
+
+// Replace inline script with redirect to close page
 app.get('/auth/callback', authLimiter, async (req, res) => {
   const code = req.query.code;
 
   if (!code) {
-    return res.send(`
-      <script>
-        window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Missing authorization code' }, ${JSON.stringify(FRONTEND_URL || "http://127.0.0.1:5173")});
-        window.close();
-      </script>
-    `);
+    return res.redirect(`/auth-complete.html?success=false&error=Missing+authorization+code`);
   }
 
   try {
-    // Exchange code for tokens (your existing logic)
     const tokenRes = await axios.post('https://accounts.spotify.com/api/token', querystring.stringify({
       grant_type: 'authorization_code',
       code,
@@ -597,52 +595,24 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
     const access_token = tokenRes.data.access_token;
     const refresh_token = tokenRes.data.refresh_token;
 
-    // Get user info
     const userRes = await axios.get('https://api.spotify.com/v1/me', {
       headers: { Authorization: `Bearer ${access_token}` }
     });
     const user_id = userRes.data.id;
 
-    // Save tokens in session
     req.session.access_token = access_token;
     req.session.refresh_token = refresh_token;
     req.session.user_id = user_id;
 
     req.session.save((err) => {
-
       if (err) {
-        return res.send(`
-          <script>
-            window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Session save failed' }, ${JSON.stringify(FRONTEND_URL || "http://127.0.0.1:5173")});
-            window.close();
-          </script>
-        `);
+        return res.redirect(`/auth-complete.html?success=false&error=Session+save+failed`);
       }
-
-      // On success, post success message and close popup
-      return res.send(`
-        <script>
-          try {
-            window.opener.postMessage(
-              { type: 'spotify-auth-success', userId: ${JSON.stringify(user_id)} },
-              ${JSON.stringify(FRONTEND_URL || "http://127.0.0.1:5173")}
-            );
-          } catch (e) {
-            console.error('postMessage failed:', e);
-          }
-          window.close();
-        </script>
-      `);
+      return res.redirect(`/auth-complete.html?success=true&userId=${encodeURIComponent(user_id)}`);
     });
-
   } catch (err) {
     console.error('Auth callback error:', err.response?.data || err.message);
-    res.send(`
-      <script>
-        window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Authentication failed' }, window.location.origin);
-        window.close();
-      </script>
-    `);
+    return res.redirect(`/auth-complete.html?success=false&error=Authentication+failed`);
   }
 });
 
