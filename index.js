@@ -587,7 +587,7 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
   const code = req.query.code;
 
   if (!code) {
-    return res.redirect(`/auth-complete.html?success=false&error=Missing+authorization+code`);
+    return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=false&error=Missing+authorization+code`);
   }
 
   try {
@@ -612,14 +612,15 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
     req.session.user_id = user_id;
 
     req.session.save((err) => {
+      console.log("SAVING SESSION", req.sessionID, req.session);
       if (err) {
-        return res.redirect(`/auth-complete.html?success=false&error=Session+save+failed`);
+        return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=false&error=Session+save+failed`);
       }
-      return res.redirect(`/auth-complete.html?success=true&userId=${encodeURIComponent(user_id)}`);
+      return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=true&userId=${encodeURIComponent(user_id)}`);
     });
   } catch (err) {
     console.error('Auth callback error:', err.response?.data || err.message);
-    return res.redirect(`/auth-complete.html?success=false&error=Authentication+failed`);
+    return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=false&error=Authentication+failed`);
   }
 });
 
@@ -774,10 +775,11 @@ app.post(
 // Simple session test endpoint (development only)
 if (!isProduction) {
   app.get('/api/session-test', (req, res) => {
+    /*
     console.log('=== SESSION TEST ===');
     console.log('Session ID:', req.sessionID);
     console.log('Session exists:', !!req.session);
-    
+    */
     // Set a test value
     req.session.testValue = 'test-' + Date.now();
     console.log('Set test value:', req.session.testValue);
@@ -815,6 +817,7 @@ if (!isProduction) {
 
   // Cookie debugging endpoint
   app.get('/api/debug-cookies', (req, res) => {
+    /*
     console.log('=== COOKIE DEBUG ===');
     console.log('Current session ID:', req.sessionID);
     console.log('Session exists:', !!req.session);
@@ -823,6 +826,7 @@ if (!isProduction) {
     console.log('Parsed cookies:', req.cookies);
     console.log('Raw cookie header:', req.headers.cookie);
     console.log('==================');
+    */
     
     res.json({
       sessionId: req.sessionID,
@@ -838,6 +842,7 @@ if (!isProduction) {
 }
 
 app.get('/api/status', authLimiter, (req, res) => {
+  /*
   if (!isProduction) {
     console.log('=== STATUS ENDPOINT DEBUG ===');
     console.log('Session ID:', req.sessionID);
@@ -847,7 +852,7 @@ app.get('/api/status', authLimiter, (req, res) => {
     console.log('Headers:', req.headers.cookie);
     console.log('============================');
   }
-  
+  */
   const isAuthenticated = !!req.session?.access_token;
   
   let quota = null;
