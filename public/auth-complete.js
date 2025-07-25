@@ -1,19 +1,29 @@
 (() => {
-  const params = new URLSearchParams(window.location.search);
-  const success = params.get('success') === 'true';
-  const message = success
-    ? { type: 'spotify-auth-success', userId: params.get('userId') }
-    : { type: 'spotify-auth-failure', error: params.get('error') };
+    const pollInterval = 1000;
+    let attempts = 0;
+    const maxAttempts = 30;
 
-    console.log("✅ popup loaded");
-    console.log("📤 posting message:", message);
-    console.log("🪟 opener:", window.opener);
-  
-    if (window.opener) {
-      window.opener.postMessage(message, "*");
-    } else {
-      console.warn("🚫 No opener found");
+    async function pollStatus() {
+      try {
+        const res = await fetch('/api/status', { credentials: 'include' });
+        const data = await res.json();
+        if (data.authenticated) {
+          console.log("Auth complete. Closing popup.");
+          window.close();
+          return;
+        }
+      } catch (err) {
+        console.error('Polling failed:', err);
+      }
+
+      attempts++;
+      if (attempts < maxAttempts) {
+        setTimeout(pollStatus, pollInterval);
+      } else {
+        alert("Login timed out. Please try again.");
+        window.close();
+      }
     }
-  // window.opener?.postMessage(message, '*');
-  window.close();
+
+    pollStatus();
 })();

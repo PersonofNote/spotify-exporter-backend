@@ -169,7 +169,7 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
 app.use(session({
   store: new FileStore({
-    path: '/app/sessions',
+    path: '/tmp/sessions',
     ttl: 24 * 60 * 60, // 24 hours in seconds
     reapInterval: 60 * 60 // Clean up expired sessions every hour
   }),
@@ -206,6 +206,13 @@ if (isProduction) {
     },
   }));
 }
+
+app.use((req, res, next) => {
+  // Allow the popup window to access window.opener
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  next();
+});
 
 // Session debugging middleware (only in development)
 if (!isProduction) {
