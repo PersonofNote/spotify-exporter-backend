@@ -169,7 +169,7 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
 app.use(session({
   store: new FileStore({
-    path: './sessions',
+    path: '/app/sessions',
     ttl: 24 * 60 * 60, // 24 hours in seconds
     reapInterval: 60 * 60 // Clean up expired sessions every hour
   }),
