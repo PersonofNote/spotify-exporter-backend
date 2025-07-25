@@ -578,7 +578,7 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
   if (!code) {
     return res.send(`
       <script>
-        window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Missing authorization code' }, window.location.origin);
+        window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Missing authorization code' }, ${JSON.stringify(FRONTEND_URL || "http://127.0.0.1:5173")});
         window.close();
       </script>
     `);
@@ -609,19 +609,27 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
     req.session.user_id = user_id;
 
     req.session.save((err) => {
+
       if (err) {
         return res.send(`
           <script>
-            window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Session save failed' }, window.location.origin);
+            window.opener.postMessage({ type: 'spotify-auth-failure', error: 'Session save failed' }, ${JSON.stringify(FRONTEND_URL || "http://127.0.0.1:5173")});
             window.close();
           </script>
         `);
       }
 
       // On success, post success message and close popup
-      res.send(`
+      return res.send(`
         <script>
-          window.opener.postMessage({ type: 'spotify-auth-success', userId: ${JSON.stringify(user_id)} }, window.location.origin);
+          try {
+            window.opener.postMessage(
+              { type: 'spotify-auth-success', userId: ${JSON.stringify(user_id)} },
+              ${JSON.stringify(FRONTEND_URL || "http://127.0.0.1:5173")}
+            );
+          } catch (e) {
+            console.error('postMessage failed:', e);
+          }
           window.close();
         </script>
       `);
