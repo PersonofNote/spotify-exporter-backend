@@ -16,9 +16,14 @@
       "downloadedTracks": 2877
     },
     "2025-07-25": {
-      "apiCalls": 945,
+      "apiCalls": 1062,
       "downloads": 1,
       "downloadedTracks": 17
+    },
+    "2025-07-26": {
+      "apiCalls": 128,
+      "downloads": 0,
+      "downloadedTracks": 0
     }
   }
 }

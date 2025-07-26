@@ -9,9 +9,6 @@ RUN npm ci
 
 COPY . .
 
-# Ensure sessions dir exists
-RUN mkdir -p /tmp/sessions
-
 EXPOSE 3000
 
 CMD ["npm", "run", "start"]
