@@ -156,6 +156,16 @@ const SCOPES = [
   'user-read-private'
 ].join(' ');
 
+app.use((req, res, next) => {
+  console.log('=== REQUEST DEBUG ===');
+  console.log('URL:', req.url);
+  console.log('Method:', req.method);
+  console.log('Session ID:', req.sessionID);
+  console.log('Request cookies:', req.headers.cookie);
+  console.log('Session data:', req.session);
+  next();
+});
+
 app.use(cors({
   origin: isProduction ? FRONTEND_URL : 'http://127.0.0.1:5173',
   credentials: true,
@@ -166,10 +176,13 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-app.use(cookieParser());
+//app.use(cookieParser());
 app.use(session({
+  name: 'spotify-session',
+  resave: false,
+  saveUninitialized: false,
   store: new FileStore({
-    path: '/app/sessions',
+    path: isProduction ? '/app/sessions' : './sessions',
     ttl: 24 * 60 * 60, // 24 hours in seconds
     reapInterval: 60 * 60 // Clean up expired sessions every hour
   }),
@@ -616,7 +629,7 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
       if (err) {
         return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=false&error=Session+save+failed`);
       }
-      return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=true&userId=${encodeURIComponent(user_id)}`);
+      return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=true&sessionId=${req.sessionID}&userId=${encodeURIComponent(user_id)}`);
     });
   } catch (err) {
     console.error('Auth callback error:', err.response?.data || err.message);
