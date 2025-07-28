@@ -1,62 +1,37 @@
 console.log('🚀 Fresh build deployed at', new Date().toISOString());
 require('dotenv').config();
 const express = require('express');
-const session = require('express-session');
-const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const axios = require('axios');
 const querystring = require('querystring');
 const { Parser: CsvParser } = require('json2csv');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
-const FileStore = require('session-file-store')(session);
+const jwt = require('jsonwebtoken');
 const path = require('path');
 const fs = require('fs');
 
-// User quota tracking
-class UserQuotaTracker {
+// In-memory quota tracking (resets on server restart)
+class InMemoryQuotaTracker {
   constructor() {
-    this.quotaFile = './user-quotas.json';
-    this.quotas = this.loadQuotas();
-    this.saveInterval = setInterval(() => this.saveQuotas(), 5 * 60 * 1000); // Save every 5 minutes
-  }
-
-  loadQuotas() {
-    try {
-      if (fs.existsSync(this.quotaFile)) {
-        const data = fs.readFileSync(this.quotaFile, 'utf8');
-        return JSON.parse(data);
-      }
-    } catch (error) {
-      console.error('Error loading quotas:', error);
-    }
-    return {};
-  }
-
-  saveQuotas() {
-    try {
-      fs.writeFileSync(this.quotaFile, JSON.stringify(this.quotas, null, 2));
-    } catch (error) {
-      console.error('Error saving quotas:', error);
-    }
+    this.quotas = new Map();
+    // Clean up old quotas daily
+    setInterval(() => this.cleanupOldQuotas(), 24 * 60 * 60 * 1000);
   }
 
   getUserQuota(userId) {
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    const today = new Date().toISOString().split('T')[0];
+    const userKey = `${userId}:${today}`;
     
-    if (!this.quotas[userId]) {
-      this.quotas[userId] = {};
-    }
-    
-    if (!this.quotas[userId][today]) {
-      this.quotas[userId][today] = {
+    if (!this.quotas.has(userKey)) {
+      this.quotas.set(userKey, {
         apiCalls: 0,
         downloads: 0,
         downloadedTracks: 0
-      };
+      });
     }
     
-    return this.quotas[userId][today];
+    return this.quotas.get(userKey);
   }
 
   incrementApiCalls(userId, count = 1) {
@@ -94,37 +69,38 @@ class UserQuotaTracker {
     };
   }
 
-  // Clean up old quota data (keep last 7 days)
   cleanupOldQuotas() {
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    const cutoffDate = sevenDaysAgo.toISOString().split('T')[0];
-
-    for (const userId in this.quotas) {
-      for (const date in this.quotas[userId]) {
-        if (date < cutoffDate) {
-          delete this.quotas[userId][date];
-        }
-      }
-      // Remove users with no recent activity
-      if (Object.keys(this.quotas[userId]).length === 0) {
-        delete this.quotas[userId];
+    const today = new Date().toISOString().split('T')[0];
+    for (const [key] of this.quotas) {
+      const [, date] = key.split(':');
+      if (date !== today) {
+        this.quotas.delete(key);
       }
     }
   }
 }
 
-const quotaTracker = new UserQuotaTracker();
+const quotaTracker = new InMemoryQuotaTracker();
 
-// Clean up old quotas daily
-setInterval(() => quotaTracker.cleanupOldQuotas(), 24 * 60 * 60 * 1000);
+// JWT utility functions
+function generateJWT(payload) {
+  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '24h' });
+}
+
+function verifyJWT(token) {
+  try {
+    return jwt.verify(token, process.env.JWT_SECRET);
+  } catch (error) {
+    return null;
+  }
+}
 
 // Environment variable validation
 const requiredEnvVars = [
   'SPOTIFY_CLIENT_ID',
   'SPOTIFY_CLIENT_SECRET', 
   'SPOTIFY_REDIRECT_URI',
-  'SESSION_SECRET'
+  'JWT_SECRET'
 ];
 
 for (const envVar of requiredEnvVars) {
@@ -156,50 +132,15 @@ const SCOPES = [
   'user-read-private'
 ].join(' ');
 
-app.use((req, res, next) => {
-  console.log('=== REQUEST DEBUG ===');
-  console.log('URL:', req.url);
-  console.log('Method:', req.method);
-  console.log('Session ID:', req.sessionID);
-  console.log('Request cookies:', req.headers.cookie);
-  console.log('Session data:', req.session);
-  next();
-});
-
 app.use(cors({
   origin: isProduction ? FRONTEND_URL : 'http://127.0.0.1:5173',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
-  exposedHeaders: ['Set-Cookie'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   optionsSuccessStatus: 200
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-//app.use(cookieParser());
-app.use(session({
-  name: 'spotify-session',
-  resave: false,
-  saveUninitialized: false,
-  store: new FileStore({
-    path: isProduction ? '/app/sessions' : './sessions',
-    ttl: 24 * 60 * 60, // 24 hours in seconds
-    reapInterval: 60 * 60 // Clean up expired sessions every hour
-  }),
-  secret: process.env.SESSION_SECRET,
-  resave: false, // Don't save session if unmodified
-  saveUninitialized: false,
-  rolling: true, // Reset expiration on activity
-  cookie: {
-    secure: isProduction, // Use secure cookies in production
-    httpOnly: true,
-    sameSite: isProduction ? 'none' : 'lax',
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours
-    path: '/' // Ensure cookie is available for all paths
-    // Don't set domain - let it default to the request domain
-  },
-  name: 'spotify-session'
-}));
 
 // Security headers for production
 if (isProduction) {
@@ -227,38 +168,34 @@ app.use((req, res, next) => {
   next();
 });
 
-// Session debugging middleware (only in development)
-if (!isProduction) {
-  app.use((req, res, next) => {
-    console.log('=== SESSION MIDDLEWARE ===');
-    console.log('Request URL:', req.url);
-    console.log('Session ID:', req.sessionID);
-    console.log('Session exists:', !!req.session);
-    console.log('Session keys:', Object.keys(req.session || {}));
-    console.log('========================');
-    next();
-  });
-}
+
 
 // Auth check middleware
 const requireAuth = (req, res, next) => {
-  if (!isProduction) {
-    console.log('=== AUTH CHECK DEBUG ===');
-    console.log('URL:', req.url);
-    console.log('Session ID:', req.sessionID);
-    console.log('Session exists:', !!req.session);
-    console.log('Has access token:', !!req.session?.access_token);
-    console.log('Cookie header:', req.headers.cookie);
-    console.log('========================');
-  }
+  const authHeader = req.headers.authorization;
   
-  if (!req.session?.access_token) {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ 
-      error: 'Authentication required',
-      sessionId: req.sessionID,
-      hasSession: !!req.session
+      error: 'Authentication required. Please provide a valid JWT token in Authorization header.'
     });
   }
+  
+  const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+  const decoded = verifyJWT(token);
+  
+  if (!decoded) {
+    return res.status(401).json({ 
+      error: 'Invalid or expired token. Please authenticate again.'
+    });
+  }
+  
+  // Add user data to request object
+  req.user = {
+    id: decoded.user_id,
+    access_token: decoded.access_token,
+    refresh_token: decoded.refresh_token
+  };
+  
   next();
 };
 
@@ -353,14 +290,14 @@ const apiLimiter = rateLimit({
 
 // User-based quota middleware
 const checkUserApiQuota = (req, res, next) => {
-  if (!req.session?.user_id) {
+  if (!req.user?.id) {
     return res.status(401).json({ error: 'User not authenticated' });
   }
 
-  if (!quotaTracker.checkApiLimit(req.session.user_id)) {
-    const status = quotaTracker.getQuotaStatus(req.session.user_id);
+  if (!quotaTracker.checkApiLimit(req.user.id)) {
+    const status = quotaTracker.getQuotaStatus(req.user.id);
     if (!isProduction) {
-      console.log(`API quota exceeded for user ${req.session.user_id}: ${status.apiCalls}/${status.apiLimit}`);
+      console.log(`API quota exceeded for user ${req.user.id}: ${status.apiCalls}/${status.apiLimit}`);
     }
     return res.status(429).json({ 
       error: 'Daily API limit exceeded', 
@@ -374,14 +311,14 @@ const checkUserApiQuota = (req, res, next) => {
 };
 
 const checkUserDownloadQuota = (req, res, next) => {
-  if (!req.session?.user_id) {
+  if (!req.user?.id) {
     return res.status(401).json({ error: 'User not authenticated' });
   }
 
-  if (!quotaTracker.checkDownloadLimit(req.session.user_id)) {
-    const status = quotaTracker.getQuotaStatus(req.session.user_id);
+  if (!quotaTracker.checkDownloadLimit(req.user.id)) {
+    const status = quotaTracker.getQuotaStatus(req.user.id);
     if (!isProduction) {
-      console.log(`Download quota exceeded for user ${req.session.user_id}: ${status.downloads}/${status.downloadLimit}`);
+      console.log(`Download quota exceeded for user ${req.user.id}: ${status.downloads}/${status.downloadLimit}`);
     }
     return res.status(429).json({ 
       error: 'Daily download limit exceeded', 
@@ -595,7 +532,7 @@ app.get('/auth', (req, res) => {
 const STATIC_DIR = path.join(__dirname, 'public');
 app.use(express.static(STATIC_DIR));
 
-// Replace inline script with redirect to close page
+// Handle OAuth callback and generate JWT
 app.get('/auth/callback', authLimiter, async (req, res) => {
   const code = req.query.code;
 
@@ -620,17 +557,14 @@ app.get('/auth/callback', authLimiter, async (req, res) => {
     });
     const user_id = userRes.data.id;
 
-    req.session.access_token = access_token;
-    req.session.refresh_token = refresh_token;
-    req.session.user_id = user_id;
-
-    req.session.save((err) => {
-      console.log("SAVING SESSION", req.sessionID, req.session);
-      if (err) {
-        return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=false&error=Session+save+failed`);
-      }
-      return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=true&sessionId=${req.sessionID}&userId=${encodeURIComponent(user_id)}`);
+    // Generate JWT token containing Spotify credentials
+    const jwtToken = generateJWT({
+      user_id,
+      access_token,
+      refresh_token
     });
+
+    return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=true&token=${encodeURIComponent(jwtToken)}&userId=${encodeURIComponent(user_id)}`);
   } catch (err) {
     console.error('Auth callback error:', err.response?.data || err.message);
     return res.redirect(`${FRONTEND_URL}/auth-complete.html?success=false&error=Authentication+failed`);
@@ -646,7 +580,7 @@ app.get('/api/playlists', requireAuth, checkUserApiQuota, apiLimiter, async (req
     
     while (url) {
       const response = await axios.get(url, {
-        headers: { Authorization: `Bearer ${req.session.access_token}` }
+        headers: { Authorization: `Bearer ${req.user.access_token}` }
       });
       apiCallCount++;
       
@@ -658,15 +592,15 @@ app.get('/api/playlists', requireAuth, checkUserApiQuota, apiLimiter, async (req
     }
     
     // Track API usage
-    quotaTracker.incrementApiCalls(req.session.user_id, apiCallCount);
+    quotaTracker.incrementApiCalls(req.user.id, apiCallCount);
     
     if (!isProduction) {
-      console.log(`User ${req.session.user_id} made ${apiCallCount} API calls for playlists`);
+      console.log(`User ${req.user.id} made ${apiCallCount} API calls for playlists`);
     }
     
     res.json({ 
       playlists,
-      quota: quotaTracker.getQuotaStatus(req.session.user_id)
+      quota: quotaTracker.getQuotaStatus(req.user.id)
     });
   } catch (err) {
     console.error('Error fetching playlists:', err.response ? err.response.data : err.message);
@@ -690,7 +624,7 @@ app.get('/api/playlists/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter,
     
     while (url) {
       const response = await axios.get(url, {
-        headers: { Authorization: `Bearer ${req.session.access_token}` }
+        headers: { Authorization: `Bearer ${req.user.access_token}` }
       });
       apiCallCount++;
       
@@ -706,15 +640,15 @@ app.get('/api/playlists/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter,
     }
     
     // Track API usage
-    quotaTracker.incrementApiCalls(req.session.user_id, apiCallCount);
+    quotaTracker.incrementApiCalls(req.user.id, apiCallCount);
     
     if (!isProduction) {
-      console.log(`User ${req.session.user_id} made ${apiCallCount} API calls for playlist ${playlistId}`);
+      console.log(`User ${req.user.id} made ${apiCallCount} API calls for playlist ${playlistId}`);
     }
     
     res.json({ 
       tracks,
-      quota: quotaTracker.getQuotaStatus(req.session.user_id)
+      quota: quotaTracker.getQuotaStatus(req.user.id)
     });
   } catch (err) {
     console.error('Error fetching tracks:', err.response ? err.response.data : err.message);
@@ -754,28 +688,28 @@ app.post(
     
     try {
       // Track the download before processing (to prevent circumvention)
-      quotaTracker.incrementDownloads(req.session.user_id, totalTracks);
+      quotaTracker.incrementDownloads(req.user.id, totalTracks);
       
       const { results: data, skippedTracks, apiCallCount } = await fetchPlaylistsAndTracksBatchedWithTracking(
-        req.session.access_token, 
+        req.user.access_token, 
         selection, 
         1000, 
         500,
-        req.session.user_id
+        req.user.id
       );
       
       // Track API usage from the batch operation
-      quotaTracker.incrementApiCalls(req.session.user_id, apiCallCount);
+      quotaTracker.incrementApiCalls(req.user.id, apiCallCount);
       
       if (!isProduction) {
-        console.log(`User ${req.session.user_id} downloaded ${totalTracks} tracks using ${apiCallCount} API calls`);
+        console.log(`User ${req.user.id} downloaded ${totalTracks} tracks using ${apiCallCount} API calls`);
       }
       
       const { content, type } = generateFile(data, format);
       res.setHeader('Content-Disposition', `attachment; filename=spotify_export.${format}`);
       res.setHeader('Content-Type', type);
       res.setHeader('X-Skipped-Tracks', JSON.stringify(skippedTracks));
-      res.setHeader('X-User-Quota', JSON.stringify(quotaTracker.getQuotaStatus(req.session.user_id)));
+      res.setHeader('X-User-Quota', JSON.stringify(quotaTracker.getQuotaStatus(req.user.id)));
       res.send(content);
     } catch (err) {
       // Add detailed logging
@@ -785,119 +719,43 @@ app.post(
   }
 );
 
-// Simple session test endpoint (development only)
-if (!isProduction) {
-  app.get('/api/session-test', (req, res) => {
-    /*
-    console.log('=== SESSION TEST ===');
-    console.log('Session ID:', req.sessionID);
-    console.log('Session exists:', !!req.session);
-    */
-    // Set a test value
-    req.session.testValue = 'test-' + Date.now();
-    console.log('Set test value:', req.session.testValue);
-    
-    res.json({
-      sessionId: req.sessionID,
-      sessionExists: !!req.session,
-      testValue: req.session.testValue,
-      sessionKeys: Object.keys(req.session || {})
-    });
-  });
-}
 
-// Test endpoint to manually check session data by session ID (development only)
-if (!isProduction) {
-  app.get('/api/test-session/:sessionId', (req, res) => {
-    const sessionId = req.params.sessionId;
-    console.log('Testing session ID:', sessionId);
-    
-    // Try to get session directly from store
-    const sessionStore = req.sessionStore;
-    sessionStore.get(sessionId, (err, session) => {
-      if (err) {
-        console.error('Error getting session:', err);
-        return res.json({ error: 'Failed to get session', details: err.message });
-      }
-      console.log('Session from store:', session);
-      res.json({
-        sessionId,
-        sessionExists: !!session,
-        hasAccessToken: !!session?.access_token
-      });
-    });
-  });
-
-  // Cookie debugging endpoint
-  app.get('/api/debug-cookies', (req, res) => {
-    /*
-    console.log('=== COOKIE DEBUG ===');
-    console.log('Current session ID:', req.sessionID);
-    console.log('Session exists:', !!req.session);
-    console.log('Has access token:', !!req.session?.access_token);
-    console.log('All request headers:', req.headers);
-    console.log('Parsed cookies:', req.cookies);
-    console.log('Raw cookie header:', req.headers.cookie);
-    console.log('==================');
-    */
-    
-    res.json({
-      sessionId: req.sessionID,
-      sessionExists: !!req.session,
-      hasAccessToken: !!req.session?.access_token,
-      cookies: req.cookies,
-      rawCookieHeader: req.headers.cookie,
-      userAgent: req.headers['user-agent'],
-      origin: req.headers.origin,
-      referer: req.headers.referer
-    });
-  });
-}
 
 app.get('/api/status', authLimiter, (req, res) => {
-  /*
-  if (!isProduction) {
-    console.log('=== STATUS ENDPOINT DEBUG ===');
-    console.log('Session ID:', req.sessionID);
-    console.log('Session exists:', !!req.session);
-    console.log('Has access token:', !!req.session?.access_token);
-    console.log('User ID:', req.session?.user_id);
-    console.log('Headers:', req.headers.cookie);
-    console.log('============================');
-  }
-  */
-  const isAuthenticated = !!req.session?.access_token;
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null;
+  const decoded = token ? verifyJWT(token) : null;
+  const isAuthenticated = !!decoded;
   
   let quota = null;
-  if (isAuthenticated && req.session.user_id) {
-    quota = quotaTracker.getQuotaStatus(req.session.user_id);
+  if (isAuthenticated && decoded.user_id) {
+    quota = quotaTracker.getQuotaStatus(decoded.user_id);
   }
   
   res.json({
     authenticated: isAuthenticated,
-    sessionId: req.sessionID,
-    hasAccessToken: !!req.session?.access_token,
-    hasRefreshToken: !!req.session?.refresh_token,
-    userId: req.session?.user_id,
+    hasAccessToken: !!decoded?.access_token,
+    hasRefreshToken: !!decoded?.refresh_token,
+    userId: decoded?.user_id,
     quota: quota
   });
 });
 
 // Get user quota information
 app.get('/api/quota', requireAuth, (req, res) => {
-  const quota = quotaTracker.getQuotaStatus(req.session.user_id);
+  const quota = quotaTracker.getQuotaStatus(req.user.id);
   res.json(quota);
 });
 
 // Debug quota endpoint (development only)
 if (!isProduction) {
   app.get('/api/debug-quota', requireAuth, (req, res) => {
-    const quota = quotaTracker.getQuotaStatus(req.session.user_id);
-    const apiLimitOk = quotaTracker.checkApiLimit(req.session.user_id);
-    const downloadLimitOk = quotaTracker.checkDownloadLimit(req.session.user_id);
+    const quota = quotaTracker.getQuotaStatus(req.user.id);
+    const apiLimitOk = quotaTracker.checkApiLimit(req.user.id);
+    const downloadLimitOk = quotaTracker.checkDownloadLimit(req.user.id);
     
     res.json({
-      userId: req.session.user_id,
+      userId: req.user.id,
       quota,
       apiLimitOk,
       downloadLimitOk,
@@ -925,8 +783,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\nShutting down gracefully...');
-  quotaTracker.saveQuotas();
-  clearInterval(quotaTracker.saveInterval);
   server.close(() => {
     console.log('Server closed');
     process.exit(0);
@@ -935,8 +791,6 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   console.log('\nShutting down gracefully...');
-  quotaTracker.saveQuotas();
-  clearInterval(quotaTracker.saveInterval);
   server.close(() => {
     console.log('Server closed');
     process.exit(0);
