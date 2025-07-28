@@ -82,6 +82,69 @@ class InMemoryQuotaTracker {
 
 const quotaTracker = new InMemoryQuotaTracker();
 
+// Client Credentials token management for public API access
+let clientCredentialsToken = null;
+let tokenExpiry = null;
+
+async function getClientCredentialsToken() {
+  // Check if we have a valid token
+  if (clientCredentialsToken && tokenExpiry && Date.now() < tokenExpiry) {
+    return clientCredentialsToken;
+  }
+
+  try {
+    const response = await axios.post('https://accounts.spotify.com/api/token', 
+      querystring.stringify({
+        grant_type: 'client_credentials'
+      }), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Authorization': `Basic ${Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64')}`
+        }
+      }
+    );
+
+    clientCredentialsToken = response.data.access_token;
+    tokenExpiry = Date.now() + (response.data.expires_in * 1000) - 60000; // Refresh 1 minute early
+    
+    return clientCredentialsToken;
+  } catch (error) {
+    console.error('Failed to get client credentials token:', error.response?.data || error.message);
+    throw new Error('Failed to authenticate with Spotify API');
+  }
+}
+
+// Playlist URL parsing and validation
+function extractPlaylistId(url) {
+  if (!url || typeof url !== 'string') {
+    return null;
+  }
+
+  // Sanitize input - remove any potential XSS or injection attempts
+  const sanitizedUrl = url.trim().replace(/[<>'"]/g, '');
+  
+  // Spotify playlist URL patterns
+  const patterns = [
+    /https?:\/\/open\.spotify\.com\/playlist\/([a-zA-Z0-9]{22})/,
+    /spotify:playlist:([a-zA-Z0-9]{22})/,
+    /^([a-zA-Z0-9]{22})$/ // Just the ID itself
+  ];
+
+  for (const pattern of patterns) {
+    const match = sanitizedUrl.match(pattern);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+// Validate Spotify playlist ID format
+function isValidPlaylistId(id) {
+  return typeof id === 'string' && /^[a-zA-Z0-9]{22}$/.test(id);
+}
+
 // JWT utility functions
 function generateJWT(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '24h' });
@@ -286,6 +349,12 @@ const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 API requests per windowMs
   message: 'Too many API requests from this IP, please try again later.'
+});
+
+const publicPlaylistLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20, // limit each IP to 20 public playlist requests per windowMs
+  message: 'Too many public playlist requests from this IP, please try again later.'
 });
 
 // User-based quota middleware
@@ -745,6 +814,196 @@ app.get('/api/status', authLimiter, (req, res) => {
 app.get('/api/quota', requireAuth, (req, res) => {
   const quota = quotaTracker.getQuotaStatus(req.user.id);
   res.json(quota);
+});
+
+// Public playlist endpoint (no authentication required)
+app.post('/api/public-playlist', publicPlaylistLimiter, express.json({ limit: '1mb' }), async (req, res) => {
+  const { playlistUrl } = req.body;
+
+  if (!playlistUrl) {
+    return res.status(400).json({ error: 'Playlist URL is required' });
+  }
+
+  // Extract and validate playlist ID
+  const playlistId = extractPlaylistId(playlistUrl);
+  if (!playlistId || !isValidPlaylistId(playlistId)) {
+    return res.status(400).json({ 
+      error: 'Invalid playlist URL. Please provide a valid Spotify playlist link.' 
+    });
+  }
+
+  try {
+    // Get client credentials token for public API access
+    const clientToken = await getClientCredentialsToken();
+
+    // Fetch playlist metadata
+    const playlistResponse = await axios.get(`https://api.spotify.com/v1/playlists/${playlistId}`, {
+      headers: { Authorization: `Bearer ${clientToken}` }
+    });
+
+    const playlist = playlistResponse.data;
+
+    // Check if playlist is public
+    if (!playlist.public) {
+      return res.status(403).json({ 
+        error: 'This playlist is private and cannot be accessed without authentication.' 
+      });
+    }
+
+    // Fetch all tracks for this playlist (handle pagination)
+    let tracks = [];
+    let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
+    
+    while (url) {
+      const tracksResponse = await axios.get(url, {
+        headers: { Authorization: `Bearer ${clientToken}` }
+      });
+      
+      const trackItems = tracksResponse.data.items
+        .map(item => item.track)
+        .filter(track => track && track.id) // Filter out null tracks
+        .map(track => ({
+          id: track.id,
+          title: track.name,
+          artists: (track.artists || []).map(a => a.name)
+        }));
+      
+      tracks = tracks.concat(trackItems);
+      url = tracksResponse.data.next;
+    }
+
+    res.json({
+      playlist: {
+        id: playlist.id,
+        name: playlist.name,
+        description: playlist.description,
+        owner: playlist.owner.display_name,
+        public: playlist.public,
+        trackCount: tracks.length
+      },
+      tracks
+    });
+
+  } catch (err) {
+    console.error('Error fetching public playlist:', err.response?.data || err.message);
+    
+    if (err.response?.status === 404) {
+      return res.status(404).json({ 
+        error: 'Playlist not found. Please check the URL and try again.' 
+      });
+    } else if (err.response?.status === 403) {
+      return res.status(403).json({ 
+        error: 'This playlist is private and cannot be accessed without authentication.' 
+      });
+    } else if (err.response?.status >= 500) {
+      return res.status(503).json({ 
+        error: 'Spotify service is temporarily unavailable. Please try again later.' 
+      });
+    } else {
+      return res.status(500).json({ 
+        error: 'Failed to fetch playlist. Please try again.' 
+      });
+    }
+  }
+});
+
+// Public playlist download endpoint
+app.post('/api/public-playlist/download', publicPlaylistLimiter, express.json({ limit: '1mb' }), async (req, res) => {
+  const { playlistUrl, selectedTrackIds, format } = req.body;
+
+  if (!playlistUrl || !selectedTrackIds || !Array.isArray(selectedTrackIds) || !format) {
+    return res.status(400).json({ error: 'Missing required fields: playlistUrl, selectedTrackIds, format' });
+  }
+
+  // Extract and validate playlist ID
+  const playlistId = extractPlaylistId(playlistUrl);
+  if (!playlistId || !isValidPlaylistId(playlistId)) {
+    return res.status(400).json({ 
+      error: 'Invalid playlist URL. Please provide a valid Spotify playlist link.' 
+    });
+  }
+
+  // Validate selected track IDs
+  if (selectedTrackIds.length === 0 || selectedTrackIds.length > 10000) {
+    return res.status(400).json({ error: 'Invalid number of selected tracks' });
+  }
+
+  if (!selectedTrackIds.every(id => typeof id === 'string' && isValidSpotifyId(id))) {
+    return res.status(400).json({ error: 'Invalid track ID format' });
+  }
+
+  try {
+    // Get client credentials token
+    const clientToken = await getClientCredentialsToken();
+
+    // Fetch playlist metadata
+    const playlistResponse = await axios.get(`https://api.spotify.com/v1/playlists/${playlistId}`, {
+      headers: { Authorization: `Bearer ${clientToken}` }
+    });
+
+    const playlist = playlistResponse.data;
+
+    if (!playlist.public) {
+      return res.status(403).json({ 
+        error: 'This playlist is private and cannot be accessed without authentication.' 
+      });
+    }
+
+    // Fetch all tracks and filter to selected ones
+    let allTracks = [];
+    let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
+    
+    while (url) {
+      const tracksResponse = await axios.get(url, {
+        headers: { Authorization: `Bearer ${clientToken}` }
+      });
+      
+      const trackItems = tracksResponse.data.items
+        .map(item => item.track)
+        .filter(track => track && track.id)
+        .map(track => ({
+          id: track.id,
+          title: track.name,
+          artists: (track.artists || []).map(a => a.name)
+        }));
+      
+      allTracks = allTracks.concat(trackItems);
+      url = tracksResponse.data.next;
+    }
+
+    // Filter to selected tracks
+    const selectedTracks = allTracks.filter(track => selectedTrackIds.includes(track.id));
+
+    // Generate file content
+    const playlistData = [{
+      id: playlist.id,
+      name: playlist.name,
+      tracks: selectedTracks
+    }];
+
+    const { content, type } = generateFile(playlistData, format);
+    
+    res.setHeader('Content-Disposition', `attachment; filename=spotify_public_playlist.${format}`);
+    res.setHeader('Content-Type', type);
+    res.send(content);
+
+  } catch (err) {
+    console.error('Error downloading public playlist:', err.response?.data || err.message);
+    
+    if (err.response?.status === 404) {
+      return res.status(404).json({ 
+        error: 'Playlist not found. Please check the URL and try again.' 
+      });
+    } else if (err.response?.status === 403) {
+      return res.status(403).json({ 
+        error: 'This playlist is private and cannot be accessed without authentication.' 
+      });
+    } else {
+      return res.status(500).json({ 
+        error: 'Failed to download playlist. Please try again.' 
+      });
+    }
+  }
 });
 
 // Debug quota endpoint (development only)
