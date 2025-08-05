@@ -1,4 +1,3 @@
-console.log('🚀 Fresh build deployed at', new Date().toISOString());
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -143,6 +142,61 @@ function extractPlaylistId(url) {
 // Validate Spotify playlist ID format
 function isValidPlaylistId(id) {
   return typeof id === 'string' && /^[a-zA-Z0-9]{22}$/.test(id);
+}
+
+// Album URL parsing and validation
+function extractAlbumId(url) {
+  if (!url || typeof url !== 'string') {
+    return null;
+  }
+
+  // Sanitize input - remove any potential XSS or injection attempts
+  const sanitizedUrl = url.trim().replace(/[<>'"]/g, '');
+  
+  // Spotify album URL patterns
+  const patterns = [
+    /https?:\/\/open\.spotify\.com\/album\/([a-zA-Z0-9]{22})/,
+    /spotify:album:([a-zA-Z0-9]{22})/,
+    /^([a-zA-Z0-9]{22})$/ // Just the ID itself
+  ];
+
+  for (const pattern of patterns) {
+    const match = sanitizedUrl.match(pattern);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+// Validate Spotify album ID format
+function isValidAlbumId(id) {
+  return typeof id === 'string' && /^[a-zA-Z0-9]{22}$/.test(id);
+}
+
+// Extract resource type and ID from Spotify URL
+function extractSpotifyResource(url) {
+  if (!url || typeof url !== 'string') {
+    return { type: null, id: null };
+  }
+
+  // Sanitize input
+  const sanitizedUrl = url.trim().replace(/[<>'"]/g, '');
+  
+  // Check for playlist URL
+  const playlistId = extractPlaylistId(sanitizedUrl);
+  if (playlistId) {
+    return { type: 'playlist', id: playlistId };
+  }
+  
+  // Check for album URL
+  const albumId = extractAlbumId(sanitizedUrl);
+  if (albumId) {
+    return { type: 'album', id: albumId };
+  }
+  
+  return { type: null, id: null };
 }
 
 // JWT utility functions
@@ -819,16 +873,18 @@ app.get('/api/quota', requireAuth, (req, res) => {
 // Public playlist endpoint (no authentication required)
 app.post('/api/public-playlist', publicPlaylistLimiter, express.json({ limit: '1mb' }), async (req, res) => {
   const { playlistUrl } = req.body;
+  console.log('Received public resource request:', playlistUrl);
 
   if (!playlistUrl) {
-    return res.status(400).json({ error: 'Playlist URL is required' });
+    return res.status(400).json({ error: 'Resource URL is required' });
   }
 
-  // Extract and validate playlist ID
-  const playlistId = extractPlaylistId(playlistUrl);
-  if (!playlistId || !isValidPlaylistId(playlistId)) {
+  // Extract and validate resource type and ID
+  const { type, id } = extractSpotifyResource(playlistUrl);
+  
+  if (!type || !id) {
     return res.status(400).json({ 
-      error: 'Invalid playlist URL. Please provide a valid Spotify playlist link.' 
+      error: 'Invalid URL. Please provide a valid Spotify playlist or album link.' 
     });
   }
 
@@ -836,64 +892,105 @@ app.post('/api/public-playlist', publicPlaylistLimiter, express.json({ limit: '1
     // Get client credentials token for public API access
     const clientToken = await getClientCredentialsToken();
 
-    // Fetch playlist metadata
-    const playlistResponse = await axios.get(`https://api.spotify.com/v1/playlists/${playlistId}`, {
-      headers: { Authorization: `Bearer ${clientToken}` }
-    });
-
-    const playlist = playlistResponse.data;
-
-    // Check if playlist is public
-    if (!playlist.public) {
-      return res.status(403).json({ 
-        error: 'This playlist is private and cannot be accessed without authentication.' 
-      });
-    }
-
-    // Fetch all tracks for this playlist (handle pagination)
-    let tracks = [];
-    let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
-    
-    while (url) {
-      const tracksResponse = await axios.get(url, {
+    if (type === 'playlist') {
+      // Fetch playlist metadata
+      const playlistResponse = await axios.get(`https://api.spotify.com/v1/playlists/${id}`, {
         headers: { Authorization: `Bearer ${clientToken}` }
       });
+
+      const playlist = playlistResponse.data;
+
+      // Check if playlist is public
+      if (!playlist.public) {
+        return res.status(403).json({ 
+          error: 'This playlist is private and cannot be accessed without authentication.' 
+        });
+      }
+
+      // Fetch all tracks for this playlist (handle pagination)
+      let tracks = [];
+      let url = `https://api.spotify.com/v1/playlists/${id}/tracks?limit=100`;
       
-      const trackItems = tracksResponse.data.items
-        .map(item => item.track)
-        .filter(track => track && track.id) // Filter out null tracks
-        .map(track => ({
-          id: track.id,
-          title: track.name,
-          artists: (track.artists || []).map(a => a.name)
-        }));
+      while (url) {
+        const tracksResponse = await axios.get(url, {
+          headers: { Authorization: `Bearer ${clientToken}` }
+        });
+        
+        const trackItems = tracksResponse.data.items
+          .map(item => item.track)
+          .filter(track => track && track.id) // Filter out null tracks
+          .map(track => ({
+            id: track.id,
+            title: track.name,
+            artists: (track.artists || []).map(a => a.name)
+          }));
+        
+        tracks = tracks.concat(trackItems);
+        url = tracksResponse.data.next;
+      }
+
+      res.json({
+        playlist: {
+          id: playlist.id,
+          name: playlist.name,
+          description: playlist.description,
+          owner: playlist.owner.display_name,
+          public: playlist.public,
+          trackCount: tracks.length
+        },
+        tracks
+      });
+    } else if (type === 'album') {
+      // Fetch album metadata
+      const albumResponse = await axios.get(`https://api.spotify.com/v1/albums/${id}`, {
+        headers: { Authorization: `Bearer ${clientToken}` }
+      });
+
+      const album = albumResponse.data;
+
+      // Fetch all tracks for this album (handle pagination)
+      let tracks = [];
+      let url = `https://api.spotify.com/v1/albums/${id}/tracks?limit=50`;
       
-      tracks = tracks.concat(trackItems);
-      url = tracksResponse.data.next;
+      while (url) {
+        const tracksResponse = await axios.get(url, {
+          headers: { Authorization: `Bearer ${clientToken}` }
+        });
+        
+        const trackItems = tracksResponse.data.items
+          .filter(track => track && track.id) // Filter out null tracks
+          .map(track => ({
+            id: track.id,
+            title: track.name,
+            artists: (track.artists || []).map(a => a.name)
+          }));
+        
+        tracks = tracks.concat(trackItems);
+        url = tracksResponse.data.next;
+      }
+
+      res.json({
+        playlist: {
+          id: album.id,
+          name: album.name,
+          description: album.label || '',
+          owner: album.artists.map(a => a.name).join(', '),
+          public: true, // Albums are always public
+          trackCount: tracks.length
+        },
+        tracks
+      });
     }
-
-    res.json({
-      playlist: {
-        id: playlist.id,
-        name: playlist.name,
-        description: playlist.description,
-        owner: playlist.owner.display_name,
-        public: playlist.public,
-        trackCount: tracks.length
-      },
-      tracks
-    });
-
   } catch (err) {
-    console.error('Error fetching public playlist:', err.response?.data || err.message);
+    console.error(`Error fetching public ${type}:`, err.response?.data || err.message);
     
     if (err.response?.status === 404) {
       return res.status(404).json({ 
-        error: 'Playlist not found. Please check the URL and try again.' 
+        error: `${type.charAt(0).toUpperCase() + type.slice(1)} not found. Please check the URL and try again.` 
       });
     } else if (err.response?.status === 403) {
       return res.status(403).json({ 
-        error: 'This playlist is private and cannot be accessed without authentication.' 
+        error: `This ${type} is private and cannot be accessed without authentication.` 
       });
     } else if (err.response?.status >= 500) {
       return res.status(503).json({ 
@@ -901,13 +998,13 @@ app.post('/api/public-playlist', publicPlaylistLimiter, express.json({ limit: '1
       });
     } else {
       return res.status(500).json({ 
-        error: 'Failed to fetch playlist. Please try again.' 
+        error: `Failed to fetch ${type}. Please try again.` 
       });
     }
   }
 });
 
-// Public playlist download endpoint
+// Public resource download endpoint
 app.post('/api/public-playlist/download', publicPlaylistLimiter, express.json({ limit: '1mb' }), async (req, res) => {
   const { playlistUrl, selectedTrackIds, format } = req.body;
 
@@ -915,11 +1012,12 @@ app.post('/api/public-playlist/download', publicPlaylistLimiter, express.json({ 
     return res.status(400).json({ error: 'Missing required fields: playlistUrl, selectedTrackIds, format' });
   }
 
-  // Extract and validate playlist ID
-  const playlistId = extractPlaylistId(playlistUrl);
-  if (!playlistId || !isValidPlaylistId(playlistId)) {
+  // Extract and validate resource type and ID
+  const { type, id } = extractSpotifyResource(playlistUrl);
+  
+  if (!type || !id) {
     return res.status(400).json({ 
-      error: 'Invalid playlist URL. Please provide a valid Spotify playlist link.' 
+      error: 'Invalid URL. Please provide a valid Spotify playlist or album link.' 
     });
   }
 
@@ -936,71 +1034,104 @@ app.post('/api/public-playlist/download', publicPlaylistLimiter, express.json({ 
     // Get client credentials token
     const clientToken = await getClientCredentialsToken();
 
-    // Fetch playlist metadata
-    const playlistResponse = await axios.get(`https://api.spotify.com/v1/playlists/${playlistId}`, {
-      headers: { Authorization: `Bearer ${clientToken}` }
-    });
-
-    const playlist = playlistResponse.data;
-
-    if (!playlist.public) {
-      return res.status(403).json({ 
-        error: 'This playlist is private and cannot be accessed without authentication.' 
-      });
-    }
-
-    // Fetch all tracks and filter to selected ones
+    let resourceName = '';
     let allTracks = [];
-    let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
-    
-    while (url) {
-      const tracksResponse = await axios.get(url, {
+
+    if (type === 'playlist') {
+      // Fetch playlist metadata
+      const playlistResponse = await axios.get(`https://api.spotify.com/v1/playlists/${id}`, {
         headers: { Authorization: `Bearer ${clientToken}` }
       });
+
+      const playlist = playlistResponse.data;
+      resourceName = playlist.name;
+
+      if (!playlist.public) {
+        return res.status(403).json({ 
+          error: 'This playlist is private and cannot be accessed without authentication.' 
+        });
+      }
+
+      // Fetch all tracks
+      let url = `https://api.spotify.com/v1/playlists/${id}/tracks?limit=100`;
       
-      const trackItems = tracksResponse.data.items
-        .map(item => item.track)
-        .filter(track => track && track.id)
-        .map(track => ({
-          id: track.id,
-          title: track.name,
-          artists: (track.artists || []).map(a => a.name)
-        }));
+      while (url) {
+        const tracksResponse = await axios.get(url, {
+          headers: { Authorization: `Bearer ${clientToken}` }
+        });
+        
+        const trackItems = tracksResponse.data.items
+          .map(item => item.track)
+          .filter(track => track && track.id)
+          .map(track => ({
+            id: track.id,
+            title: track.name,
+            artists: (track.artists || []).map(a => a.name)
+          }));
+        
+        allTracks = allTracks.concat(trackItems);
+        url = tracksResponse.data.next;
+      }
+    } else if (type === 'album') {
+      // Fetch album metadata
+      const albumResponse = await axios.get(`https://api.spotify.com/v1/albums/${id}`, {
+        headers: { Authorization: `Bearer ${clientToken}` }
+      });
+
+      const album = albumResponse.data;
+      resourceName = album.name;
+
+      // Fetch all tracks
+      let url = `https://api.spotify.com/v1/albums/${id}/tracks?limit=50`;
       
-      allTracks = allTracks.concat(trackItems);
-      url = tracksResponse.data.next;
+      while (url) {
+        const tracksResponse = await axios.get(url, {
+          headers: { Authorization: `Bearer ${clientToken}` }
+        });
+        
+        const trackItems = tracksResponse.data.items
+          .filter(track => track && track.id)
+          .map(track => ({
+            id: track.id,
+            title: track.name,
+            artists: (track.artists || []).map(a => a.name)
+          }));
+        
+        allTracks = allTracks.concat(trackItems);
+        url = tracksResponse.data.next;
+      }
     }
 
     // Filter to selected tracks
     const selectedTracks = allTracks.filter(track => selectedTrackIds.includes(track.id));
 
     // Generate file content
-    const playlistData = [{
-      id: playlist.id,
-      name: playlist.name,
+    const resourceData = [{
+      id: id,
+      name: resourceName,
       tracks: selectedTracks
     }];
 
-    const { content, type } = generateFile(playlistData, format);
+    const { content, type: contentType } = generateFile(resourceData, format);
     
-    res.setHeader('Content-Disposition', `attachment; filename=spotify_public_playlist.${format}`);
-    res.setHeader('Content-Type', type);
+    res.setHeader('Content-Disposition', `attachment; filename=spotify_${type}.${format}`);
+    res.setHeader('Content-Type', contentType);
     res.send(content);
 
   } catch (err) {
-    console.error('Error downloading public playlist:', err.response?.data || err.message);
+    console.error(`Error downloading public ${type}:`, err.response?.data || err.message);
     
     if (err.response?.status === 404) {
       return res.status(404).json({ 
-        error: 'Playlist not found. Please check the URL and try again.' 
+        error: `${type.charAt(0).toUpperCase() + type.slice(1)} not found. Please check the URL and try again.` 
       });
     } else if (err.response?.status === 403) {
       return res.status(403).json({ 
-        error: 'This playlist is private and cannot be accessed without authentication.' 
+        error: `This ${type} is private and cannot be accessed without authentication.` 
       });
     } else {
       return res.status(500).json({ 
-        error: 'Failed to download playlist. Please try again.' 
+        error: `Failed to download ${type}. Please try again.` 
       });
     }
   }
