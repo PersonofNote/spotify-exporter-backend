@@ -627,6 +627,69 @@ async function fetchPlaylistsAndTracksBatchedWithTracking(accessToken, selection
   return { results: allResults, skippedTracks, apiCallCount: totalApiCalls };
 }
 
+async function fetchAlbumsAndTracksBatchedWithTracking(accessToken, selection, batchSize = 1000, delayMs = 500, userId) {
+  // selection: [{ albumId, trackIds: [trackId, ...] }]
+  const batches = chunkArray(selection, batchSize);
+  let allResults = [];
+  let skippedTracks = [];
+  let totalApiCalls = 0;
+  
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const batchResults = [];
+    for (const sel of batch) {
+      // Fetch album metadata
+      const albumRes = await axios.get(`https://api.spotify.com/v1/albums/${sel.albumId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      totalApiCalls++;
+      const album = albumRes.data;
+      
+      // Fetch all tracks for this album (handle pagination)
+      let tracks = [];
+      let url = `https://api.spotify.com/v1/albums/${sel.albumId}/tracks?limit=50`;
+      while (url) {
+        const tracksRes = await axios.get(url, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        totalApiCalls++;
+        tracks = tracks.concat(tracksRes.data.items);
+        url = tracksRes.data.next;
+      }
+      
+      // Filter tracks to only those selected
+      const selectedTracks = [];
+      for (const trackId of sel.trackIds) {
+        const track = tracks.find(t => t && t.id === trackId);
+        if (track) {
+          selectedTracks.push({
+            id: track.id,
+            title: track.name,
+            artists: (track.artists || []).map(a => a.name)
+          });
+        } else {
+          // Track not found in album
+          skippedTracks.push({
+            albumName: album.name,
+            title: `Unknown track (ID: ${trackId})`,
+            reason: 'track_not_found'
+          });
+        }
+      }
+      batchResults.push({
+        id: album.id,
+        name: album.name,
+        tracks: selectedTracks
+      });
+    }
+    allResults = allResults.concat(batchResults);
+    if (i < batches.length - 1) {
+      await sleep(delayMs); // Wait before next batch
+    }
+  }
+  return { results: allResults, skippedTracks, apiCallCount: totalApiCalls };
+}
+
 app.get('/', (req, res) => {
   res.send('Spotify Collector Backend Running');
 });
@@ -779,6 +842,91 @@ app.get('/api/playlists/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter,
   }
 });
 
+// Get user's saved albums
+app.get('/api/albums', requireAuth, checkUserApiQuota, apiLimiter, async (req, res) => {
+  try {
+    const albums = [];
+    let url = 'https://api.spotify.com/v1/me/albums?limit=50';
+    let apiCallCount = 0;
+    
+    while (url) {
+      const response = await axios.get(url, {
+        headers: { Authorization: `Bearer ${req.user.access_token}` }
+      });
+      apiCallCount++;
+      
+      albums.push(...response.data.items.map(item => ({
+        id: item.album.id,
+        name: item.album.name,
+        type: 'album' // Add a type field to distinguish from playlists
+      })));
+      url = response.data.next;
+    }
+    
+    // Track API usage
+    quotaTracker.incrementApiCalls(req.user.id, apiCallCount);
+    
+    if (!isProduction) {
+      console.log(`User ${req.user.id} made ${apiCallCount} API calls for albums`);
+    }
+    
+    res.json({ 
+      albums,
+      quota: quotaTracker.getQuotaStatus(req.user.id)
+    });
+  } catch (err) {
+    console.error('Error fetching albums:', err.response ? err.response.data : err.message);
+    res.status(err.response?.status || 500).json({ error: sanitizeError(err) });
+  }
+});
+
+// Get tracks for an album
+app.get('/api/albums/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter, async (req, res) => {
+  const albumId = req.params.id;
+  
+  // Validate album ID
+  if (!isValidSpotifyId(albumId)) {
+    return res.status(400).json({ error: 'Invalid album ID' });
+  }
+  
+  try {
+    const tracks = [];
+    let url = `https://api.spotify.com/v1/albums/${albumId}/tracks?limit=50`;
+    let apiCallCount = 0;
+    
+    while (url) {
+      const response = await axios.get(url, {
+        headers: { Authorization: `Bearer ${req.user.access_token}` }
+      });
+      apiCallCount++;
+      
+      tracks.push(...response.data.items.map(track => {
+        return {
+          id: track.id,
+          title: track.name,
+          artists: track.artists.map(a => a.name)
+        };
+      }));
+      url = response.data.next;
+    }
+    
+    // Track API usage
+    quotaTracker.incrementApiCalls(req.user.id, apiCallCount);
+    
+    if (!isProduction) {
+      console.log(`User ${req.user.id} made ${apiCallCount} API calls for album ${albumId}`);
+    }
+    
+    res.json({ 
+      tracks,
+      quota: quotaTracker.getQuotaStatus(req.user.id)
+    });
+  } catch (err) {
+    console.error('Error fetching album tracks:', err.response ? err.response.data : err.message);
+    res.status(err.response?.status || 500).json({ error: sanitizeError(err) });
+  }
+});
+
 app.post(
   '/api/download',
   requireAuth,
@@ -798,12 +946,26 @@ app.post(
     // Validate selection structure
     for (const sel of selection) {
       if (
-        typeof sel.playlistId !== 'string' ||
-        !isValidSpotifyId(sel.playlistId) ||
-        !Array.isArray(sel.trackIds) ||
-        sel.trackIds.length === 0 ||
-        sel.trackIds.length > 10000 || // Limit to prevent abuse
-        !sel.trackIds.every(id => (typeof id === 'string' && isValidSpotifyId(id)) || id === null)
+        // Check if it's a playlist selection
+        (sel.playlistId && (
+          typeof sel.playlistId !== 'string' ||
+          !isValidSpotifyId(sel.playlistId) ||
+          !Array.isArray(sel.trackIds) ||
+          sel.trackIds.length === 0 ||
+          sel.trackIds.length > 10000 || // Limit to prevent abuse
+          !sel.trackIds.every(id => (typeof id === 'string' && isValidSpotifyId(id)) || id === null)
+        )) ||
+        // Check if it's an album selection
+        (sel.albumId && (
+          typeof sel.albumId !== 'string' ||
+          !isValidSpotifyId(sel.albumId) ||
+          !Array.isArray(sel.trackIds) ||
+          sel.trackIds.length === 0 ||
+          sel.trackIds.length > 10000 || // Limit to prevent abuse
+          !sel.trackIds.every(id => (typeof id === 'string' && isValidSpotifyId(id)) || id === null)
+        )) ||
+        // Check if it's neither a playlist nor an album selection
+        (!sel.playlistId && !sel.albumId)
       ) {
         return res.status(400).json({ error: 'Invalid selection structure' });
       }
@@ -813,25 +975,53 @@ app.post(
       // Track the download before processing (to prevent circumvention)
       quotaTracker.incrementDownloads(req.user.id, totalTracks);
       
-      const { results: data, skippedTracks, apiCallCount } = await fetchPlaylistsAndTracksBatchedWithTracking(
-        req.user.access_token, 
-        selection, 
-        1000, 
-        500,
-        req.user.id
-      );
+      // Separate playlists and albums
+      const playlistSelection = selection.filter(sel => sel.playlistId);
+      const albumSelection = selection.filter(sel => sel.albumId);
       
-      // Track API usage from the batch operation
-      quotaTracker.incrementApiCalls(req.user.id, apiCallCount);
+      let allResults = [];
+      let allSkippedTracks = [];
+      let totalApiCalls = 0;
       
-      if (!isProduction) {
-        console.log(`User ${req.user.id} downloaded ${totalTracks} tracks using ${apiCallCount} API calls`);
+      // Fetch playlists and tracks
+      if (playlistSelection.length > 0) {
+        const { results, skippedTracks, apiCallCount } = await fetchPlaylistsAndTracksBatchedWithTracking(
+          req.user.access_token, 
+          playlistSelection, 
+          1000, 
+          500,
+          req.user.id
+        );
+        allResults = allResults.concat(results);
+        allSkippedTracks = allSkippedTracks.concat(skippedTracks);
+        totalApiCalls += apiCallCount;
       }
       
-      const { content, type } = generateFile(data, format);
+      // Fetch albums and tracks
+      if (albumSelection.length > 0) {
+        const { results, skippedTracks, apiCallCount } = await fetchAlbumsAndTracksBatchedWithTracking(
+          req.user.access_token, 
+          albumSelection, 
+          1000, 
+          500,
+          req.user.id
+        );
+        allResults = allResults.concat(results);
+        allSkippedTracks = allSkippedTracks.concat(skippedTracks);
+        totalApiCalls += apiCallCount;
+      }
+      
+      // Track API usage from the batch operations
+      quotaTracker.incrementApiCalls(req.user.id, totalApiCalls);
+      
+      if (!isProduction) {
+        console.log(`User ${req.user.id} downloaded ${totalTracks} tracks using ${totalApiCalls} API calls`);
+      }
+      
+      const { content, type } = generateFile(allResults, format);
       res.setHeader('Content-Disposition', `attachment; filename=spotify_export.${format}`);
       res.setHeader('Content-Type', type);
-      res.setHeader('X-Skipped-Tracks', JSON.stringify(skippedTracks));
+      res.setHeader('X-Skipped-Tracks', JSON.stringify(allSkippedTracks));
       res.setHeader('X-User-Quota', JSON.stringify(quotaTracker.getQuotaStatus(req.user.id)));
       res.send(content);
     } catch (err) {
