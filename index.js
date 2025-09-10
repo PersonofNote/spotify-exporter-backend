@@ -348,7 +348,7 @@ function normalizeData(data) {
       ...track,
       title: normalizeText(track.title),
       artists: (track.artists || []).map(normalizeText),
-      album: track.album.name || 'no album found'
+      album: track.album
     }))
   }));
 }
@@ -367,11 +367,11 @@ function generateFile(data, format) {
           playlist: pl.name,
           title: track.title,
           artists: (track.artists || []).join(', '),
-          album: track.album.name || 'no album found'
+          album: track.album || 'no album found'
         });
       });
     });
-    const parser = new CsvParser({ fields: ['playlist', 'title', 'artists'] });
+    const parser = new CsvParser({ fields: ['playlist', 'title', 'artists', 'album'] });
     return { content: parser.parse(rows), type: 'text/csv; charset=utf-8' };
   } else if (format === 'txt') {
     // Simple text format
@@ -379,7 +379,7 @@ function generateFile(data, format) {
     safeData.forEach(pl => {
       txt += `Playlist: ${pl.name}\n`;
       (pl.tracks || []).forEach(track => {
-        txt += `  - ${track.title} – ${track.artists.join(', ')} - ${track.album.name || 'no album found'}\n`;
+        txt += `  - ${track.title} – ${track.artists.join(', ')} - ${track.album || 'no album found'}\n`;
       });
       txt += '\n';
     });
@@ -670,7 +670,7 @@ async function fetchAlbumsAndTracksBatchedWithTracking(accessToken, selection, b
             id: track.id,
             title: track.name,
             artists: (track.artists || []).map(a => a.name),
-            album: track.album.name || 'no album found'
+            album: album.name || 'no album found'
           });
         } else {
           // Track not found in album
@@ -825,7 +825,7 @@ app.get('/api/playlists/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter,
           id: t.id,
           title: t.name,
           artists: t.artists.map(a => a.name),
-          album: track.album.name || 'no album found'
+          album: t.album.name || 'no album found'
         };
       }));
       url = response.data.next;
@@ -896,9 +896,15 @@ app.get('/api/albums/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter, as
   }
   
   try {
+    // First get album information
+    const albumResponse = await axios.get(`https://api.spotify.com/v1/albums/${albumId}`, {
+      headers: { Authorization: `Bearer ${req.user.access_token}` }
+    });
+    const albumName = albumResponse.data.name;
+    let apiCallCount = 1; // Count the album metadata call
+    
     const tracks = [];
     let url = `https://api.spotify.com/v1/albums/${albumId}/tracks?limit=50`;
-    let apiCallCount = 0;
     
     while (url) {
       const response = await axios.get(url, {
@@ -911,7 +917,7 @@ app.get('/api/albums/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter, as
           id: track.id,
           title: track.name,
           artists: track.artists.map(a => a.name),
-          album: track.album.name || 'no album found'
+          album: albumName || 'no album found'
         };
       }));
       url = response.data.next;
