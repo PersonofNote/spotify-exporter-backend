@@ -347,7 +347,8 @@ function normalizeData(data) {
     tracks: (pl.tracks || []).map(track => ({
       ...track,
       title: normalizeText(track.title),
-      artists: (track.artists || []).map(normalizeText)
+      artists: (track.artists || []).map(normalizeText),
+      album: track.album.name || 'no album found'
     }))
   }));
 }
@@ -365,7 +366,8 @@ function generateFile(data, format) {
         rows.push({
           playlist: pl.name,
           title: track.title,
-          artists: (track.artists || []).join(', ')
+          artists: (track.artists || []).join(', '),
+          album: track.album.name || 'no album found'
         });
       });
     });
@@ -377,7 +379,7 @@ function generateFile(data, format) {
     safeData.forEach(pl => {
       txt += `Playlist: ${pl.name}\n`;
       (pl.tracks || []).forEach(track => {
-        txt += `  - ${track.title} – ${track.artists.join(', ')}\n`;
+        txt += `  - ${track.title} – ${track.artists.join(', ')} - ${track.album.name || 'no album found'}\n`;
       });
       txt += '\n';
     });
@@ -525,7 +527,8 @@ async function fetchPlaylistsAndTracksBatched(accessToken, selection, batchSize 
           selectedTracks.push({
             id: track.id,
             title: track.name,
-            artists: (track.artists || []).map(a => a.name)
+            artists: (track.artists || []).map(a => a.name),
+            album: track.album.name || 'no album found'
           });
         } else {
           // Track not found in playlist
@@ -602,7 +605,8 @@ async function fetchPlaylistsAndTracksBatchedWithTracking(accessToken, selection
           selectedTracks.push({
             id: track.id,
             title: track.name,
-            artists: (track.artists || []).map(a => a.name)
+            artists: (track.artists || []).map(a => a.name),
+            album: track.album.name || 'no album found'
           });
         } else {
           // Track not found in playlist
@@ -665,7 +669,8 @@ async function fetchAlbumsAndTracksBatchedWithTracking(accessToken, selection, b
           selectedTracks.push({
             id: track.id,
             title: track.name,
-            artists: (track.artists || []).map(a => a.name)
+            artists: (track.artists || []).map(a => a.name),
+            album: track.album.name || 'no album found'
           });
         } else {
           // Track not found in album
@@ -819,7 +824,8 @@ app.get('/api/playlists/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter,
         return {
           id: t.id,
           title: t.name,
-          artists: t.artists.map(a => a.name)
+          artists: t.artists.map(a => a.name),
+          album: track.album.name || 'no album found'
         };
       }));
       url = response.data.next;
@@ -904,7 +910,8 @@ app.get('/api/albums/:id/tracks', requireAuth, checkUserApiQuota, apiLimiter, as
         return {
           id: track.id,
           title: track.name,
-          artists: track.artists.map(a => a.name)
+          artists: track.artists.map(a => a.name),
+          album: track.album.name || 'no album found'
         };
       }));
       url = response.data.next;
@@ -1112,7 +1119,8 @@ app.post('/api/public-playlist', publicPlaylistLimiter, express.json({ limit: '1
           .map(track => ({
             id: track.id,
             title: track.name,
-            artists: (track.artists || []).map(a => a.name)
+            artists: (track.artists || []).map(a => a.name),
+            album: track.album ? track.album.name : 'no album found'
           }));
         
         tracks = tracks.concat(trackItems);
@@ -1152,7 +1160,8 @@ app.post('/api/public-playlist', publicPlaylistLimiter, express.json({ limit: '1
           .map(track => ({
             id: track.id,
             title: track.name,
-            artists: (track.artists || []).map(a => a.name)
+            artists: (track.artists || []).map(a => a.name),
+            album: track.album.name || 'no album found'
           }));
         
         tracks = tracks.concat(trackItems);
@@ -1256,10 +1265,13 @@ app.post('/api/public-playlist/download', publicPlaylistLimiter, express.json({ 
           .map(track => ({
             id: track.id,
             title: track.name,
-            artists: (track.artists || []).map(a => a.name)
+            artists: (track.artists || []).map(a => a.name),
+            album: track.album.name || 'no album found'
           }));
         
         allTracks = allTracks.concat(trackItems);
+        console.log('Downloading tracks')
+        console.log(allTracks)
         url = tracksResponse.data.next;
       }
     } else if (type === 'album') {
@@ -1284,7 +1296,8 @@ app.post('/api/public-playlist/download', publicPlaylistLimiter, express.json({ 
           .map(track => ({
             id: track.id,
             title: track.name,
-            artists: (track.artists || []).map(a => a.name)
+            artists: (track.artists || []).map(a => a.name),
+            album: track.album.name || 'no album found'
           }));
         
         allTracks = allTracks.concat(trackItems);
